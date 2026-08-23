@@ -1,0 +1,24 @@
+# Copy this file to config/config.toml and fill in the values you want to
+# use as defaults. Every key here can also be passed as a CLI flag; a CLI
+# flag only overrides its matching key if you actually pass it.
+
+owner = "SCOTT"
+# object = "CUSTOMER_ADDRESSES"
+# object = "EMPLOYEES,DEPARTMENTS"
+all_objects = false
+
+timeout_seconds = 30
+include_source_tables = false
+# row_limit = 500
+include_non_ascii = false
+
+output_dir = "output/reports"
+# fixes_dir = "output/reports/fixes"
+generate_fixes = true
+fix_grouping = "row"
+
+sample_row_limit = 200
+sample_char_limit = 20
+
+detect_mojibake = false
+mojibake_sample_limit = 10

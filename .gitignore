@@ -1,0 +1,13 @@
+.venv*/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
+
+config/.env
+config/config.toml
+
+output/logs/*.log
+output/reports/*.txt
+output/reports/fixes/*.sql
