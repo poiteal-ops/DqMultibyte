@@ -4,7 +4,14 @@ __pycache__/
 *.egg-info/
 build/
 dist/
+.pytest_cache/
 
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+
+.env
 config/.env
 config/config.toml
 
