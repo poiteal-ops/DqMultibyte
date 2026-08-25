@@ -61,6 +61,14 @@ de-duplicated.
 
 ## CLI usage
 
+Every example below uses the installed `mbscan` console script. Without an
+install on `PATH` -- e.g. running straight from a cloned repo on Linux --
+substitute `python -m mbscan`, which takes identical flags:
+
+```bash
+python -m mbscan --row-limit 500
+```
+
 ```bash
 # Everything from config/config.toml
 mbscan
@@ -96,9 +104,6 @@ mbscan --sample-row-limit 1000 --sample-char-limit 50
 mbscan --detect-mojibake --mojibake-sample-limit 25
 mbscan --no-detect-mojibake
 ```
-
-`python -m mbscan` works identically to the installed `mbscan` console
-script.
 
 Each run writes:
 - a scan report to `output/reports/<timestamp>_report_<owner>_<object>.txt`
