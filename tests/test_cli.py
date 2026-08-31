@@ -49,7 +49,7 @@ def _stub_successful_run(monkeypatch, obj, connect_spy=None):
     monkeypatch.setattr(cli, "resolve_requested_objects", lambda cursor, owner, names: (obj,))
     monkeypatch.setattr(
         cli, "scan_objects",
-        lambda cursor, selected, settings, progress=None: SimpleNamespace(
+        lambda cursor, selected, settings, progress=None, **kwargs: SimpleNamespace(
             selected=tuple(selected), settings=settings, dependencies=(), objects=[]
         ),
     )
@@ -109,7 +109,7 @@ def test_run_lets_a_cli_flag_override_one_config_key(monkeypatch, tmp_path):
     obj = DbObject("SCOTT", "T1", "TABLE")
     captured = {}
 
-    def fake_scan_objects(cursor, selected, settings, progress=None):
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["settings"] = settings
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
@@ -127,7 +127,7 @@ def test_run_lets_a_cli_flag_override_a_true_config_value_back_to_false(monkeypa
     obj = DbObject("SCOTT", "T1", "TABLE")
     captured = {}
 
-    def fake_scan_objects(cursor, selected, settings, progress=None):
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["settings"] = settings
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
@@ -175,7 +175,7 @@ def test_run_resolves_exact_case_match_even_when_a_case_insensitive_duplicate_ex
     obj = DbObject("SCOTT", "FOO", "VIEW")
     captured = {}
 
-    def fake_scan_objects(cursor, selected, settings, progress=None):
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["selected"] = tuple(selected)
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
@@ -224,7 +224,7 @@ def test_run_all_objects_scans_every_exportable_object(monkeypatch, tmp_path):
     second = DbObject("SCOTT", "T2", "VIEW")
     scanned = []
 
-    def fake_scan_objects(cursor, selected, settings, progress=None):
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         scanned.extend(selected)
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
@@ -265,7 +265,7 @@ def test_run_resolves_explicit_object_list_and_scans_once_as_a_batch(monkeypatch
     second = DbObject("SCOTT", "T2", "VIEW")
     captured = {}
 
-    def fake_scan_objects(cursor, selected, settings, progress=None):
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["selected"] = tuple(selected)
         captured["progress"] = progress
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=())
@@ -287,7 +287,7 @@ def test_multibyte_all_objects_ignores_object_list_and_notifies(monkeypatch, cap
     second = DbObject("HR", "DEPARTMENTS", "TABLE")
     captured = {}
 
-    def fake_scan_objects(cursor, selected, settings, progress=None):
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["selected"] = tuple(selected)
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=())
 
@@ -334,7 +334,7 @@ def test_run_passes_a_callable_progress_factory_into_scan_objects(monkeypatch, t
     obj = DbObject("SCOTT", "T1", "TABLE")
     captured = {}
 
-    def fake_scan_objects(cursor, selected, settings, progress=None):
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["progress"] = progress
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
@@ -416,7 +416,7 @@ def test_run_derives_fixes_dir_from_output_dir_when_not_given(monkeypatch, tmp_p
     _stub_successful_run(monkeypatch, obj)
     monkeypatch.setattr(
         cli, "scan_objects",
-        lambda cursor, selected, settings, progress=None: SimpleNamespace(
+        lambda cursor, selected, settings, progress=None, **kwargs: SimpleNamespace(
             selected=tuple(selected), settings=settings, dependencies=(), objects=[obj_result]
         ),
     )
@@ -441,7 +441,7 @@ def test_run_lets_explicit_fixes_dir_override_the_derived_default(monkeypatch, t
     _stub_successful_run(monkeypatch, obj)
     monkeypatch.setattr(
         cli, "scan_objects",
-        lambda cursor, selected, settings, progress=None: SimpleNamespace(
+        lambda cursor, selected, settings, progress=None, **kwargs: SimpleNamespace(
             selected=tuple(selected), settings=settings, dependencies=(), objects=[obj_result]
         ),
     )
@@ -461,7 +461,7 @@ def test_run_no_generate_fixes_suppresses_all_fix_writing(monkeypatch, tmp_path)
     _stub_successful_run(monkeypatch, obj)
     monkeypatch.setattr(
         cli, "scan_objects",
-        lambda cursor, selected, settings, progress=None: SimpleNamespace(
+        lambda cursor, selected, settings, progress=None, **kwargs: SimpleNamespace(
             selected=tuple(selected), settings=settings, dependencies=(), objects=[obj_result]
         ),
     )
@@ -479,7 +479,7 @@ def test_run_passes_sample_row_and_char_limits_into_scan_settings(monkeypatch, t
     obj = DbObject("SCOTT", "T1", "TABLE")
     captured = {}
 
-    def fake_scan_objects(cursor, selected, settings, progress=None):
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["settings"] = settings
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
@@ -516,7 +516,7 @@ def test_run_passes_mojibake_settings_into_scan_settings(monkeypatch, tmp_path):
     obj = DbObject("SCOTT", "T1", "TABLE")
     captured = {}
 
-    def fake_scan_objects(cursor, selected, settings, progress=None):
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["settings"] = settings
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
@@ -549,3 +549,109 @@ def test_run_logs_resolved_mojibake_settings(monkeypatch, tmp_path, caplog):
     )
     assert "detect_mojibake=True" in resolved_log
     assert "mojibake_sample_limit=3" in resolved_log
+
+
+def test_detect_truncated_flag_defaults_to_none_and_supports_negation():
+    assert _register().parse_args([]).detect_truncated is None
+    assert _register().parse_args(["--detect-truncated"]).detect_truncated is True
+    assert _register().parse_args(["--no-detect-truncated"]).detect_truncated is False
+
+
+def test_run_passes_detect_truncated_into_scan_settings(monkeypatch, tmp_path):
+    obj = DbObject("SCOTT", "T1", "TABLE")
+    captured = {}
+
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
+        captured["settings"] = settings
+        return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
+
+    _stub_successful_run(monkeypatch, obj)
+    monkeypatch.setattr(cli, "scan_objects", fake_scan_objects)
+    _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1"})
+
+    exit_code = _run(["--detect-truncated", "--output-dir", str(tmp_path)])
+
+    assert exit_code == 0
+    assert captured["settings"].detect_truncated is True
+
+
+def test_run_json_entry_scans_manifest_targets_with_a_column_filter(monkeypatch, tmp_path):
+    from mbscan.manifest import ManifestTable, ScanManifest
+
+    t1 = DbObject("DQ_TEST", "CUSTOMER_ADDRESSES", "TABLE")
+    t2 = DbObject("DQ_TEST", "EMPLOYEES", "TABLE")
+    captured = {}
+
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
+        captured["selected"] = tuple(selected)
+        captured["column_filter"] = kwargs.get("column_filter")
+        return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
+
+    _stub_successful_run(monkeypatch, t1)
+    monkeypatch.setattr(cli, "scan_objects", fake_scan_objects)
+    monkeypatch.setattr(cli, "resolve_requested_objects", lambda cursor, owner, names: (t1, t2))
+    monkeypatch.setattr(
+        cli,
+        "load_scan_manifest",
+        lambda path: ScanManifest(
+            owner="DQ_TEST",
+            tables=(
+                ManifestTable("CUSTOMER_ADDRESSES", ("CITY",)),
+                ManifestTable("EMPLOYEES", ()),
+            ),
+        ),
+    )
+    _with_config(monkeypatch, {"json_entry": True})
+
+    exit_code = _run(["--output-dir", str(tmp_path)])
+
+    assert exit_code == 0
+    assert captured["selected"] == (t1, t2)
+    assert captured["column_filter"] == {
+        ("DQ_TEST", "CUSTOMER_ADDRESSES", "TABLE"): frozenset({"CITY"})
+    }
+
+
+@pytest.mark.parametrize(
+    "config, argv",
+    [
+        ({"json_entry": True, "all_objects": True, "owner": "X"}, []),
+        ({"json_entry": True, "object": "T1"}, []),
+        ({"json_entry": True}, ["--interactive"]),
+    ],
+)
+def test_run_json_entry_conflicts_with_other_selection_modes(monkeypatch, tmp_path, capsys, config, argv):
+    monkeypatch.setattr(cli, "connect", lambda *a, **k: pytest.fail("must not connect"))
+    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name: Path("unused.log"))
+    _with_config(monkeypatch, config)
+
+    exit_code = _run(argv + ["--output-dir", str(tmp_path)])
+
+    assert exit_code == 2
+    assert "Configuration error" in capsys.readouterr().out
+
+
+def test_json_entry_flags_default_to_none_and_parse():
+    parsed = _register().parse_args([])
+    assert parsed.json_entry is None
+    assert parsed.json_entry_file is None
+    assert _register().parse_args(["--json-entry"]).json_entry is True
+    assert _register().parse_args(["--no-json-entry"]).json_entry is False
+    assert _register().parse_args(
+        ["--json-entry-file", "config/x.json"]
+    ).json_entry_file == Path("config/x.json")
+
+
+def test_run_logs_resolved_detect_truncated(monkeypatch, tmp_path, caplog):
+    obj = DbObject("SCOTT", "T1", "TABLE")
+    _stub_successful_run(monkeypatch, obj)
+    _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1"})
+
+    with caplog.at_level(logging.INFO, logger="mbscan.cli"):
+        exit_code = _run(["--detect-truncated", "--output-dir", str(tmp_path)])
+
+    assert exit_code == 0
+    resolved_log = next(
+        record.getMessage() for record in caplog.records if "Resolved settings" in record.getMessage()
+    )
+    assert "detect_truncated=True" in resolved_log

@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from mbscan.files import REPORTS_DIR
+from mbscan.manifest import DEFAULT_MANIFEST_PATH
 from mbscan.oracle.connection import ConfigError
 from mbscan.oracle.metadata import parse_object_names
 from mbscan.scan import ScanSettings
@@ -49,6 +50,8 @@ class ResolvedSettings:
     fixes_dir: Optional[Path]
     generate_fixes: bool
     fix_grouping: str = "row"
+    json_entry: bool = False
+    json_entry_file: Path = DEFAULT_MANIFEST_PATH
 
 
 def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
@@ -96,6 +99,11 @@ def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
         else config.get("mojibake_sample_limit", 10)
     )
     mojibake_sample_limit = _validate_positive_int(mojibake_sample_limit, "mojibake_sample_limit")
+    detect_truncated = (
+        args.detect_truncated
+        if args.detect_truncated is not None
+        else config.get("detect_truncated", False)
+    )
     output_dir = Path(args.output_dir) if args.output_dir is not None else Path(config.get("output_dir", REPORTS_DIR))
     fixes_dir_value = args.fixes_dir if args.fixes_dir is not None else config.get("fixes_dir")
     fixes_dir = Path(fixes_dir_value) if fixes_dir_value is not None else None
@@ -104,6 +112,15 @@ def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
     )
     fix_grouping = args.fix_grouping if args.fix_grouping is not None else config.get("fix_grouping", "row")
     fix_grouping = _validate_fix_grouping(fix_grouping)
+    json_entry = args.json_entry if args.json_entry is not None else config.get("json_entry", False)
+    if not isinstance(json_entry, bool):
+        raise ConfigError("json_entry must be a boolean, got {0!r}".format(json_entry))
+    json_entry_file_value = (
+        args.json_entry_file if args.json_entry_file is not None else config.get("json_entry_file")
+    )
+    json_entry_file = (
+        Path(json_entry_file_value) if json_entry_file_value is not None else DEFAULT_MANIFEST_PATH
+    )
     return ResolvedSettings(
         owner=owner,
         object_names=object_names,
@@ -119,9 +136,12 @@ def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
             detect_mojibake=detect_mojibake,
             mojibake_sample_limit=mojibake_sample_limit,
             capture_mojibake_rowids=generate_fixes and fix_grouping == "row" and detect_mojibake,
+            detect_truncated=detect_truncated,
         ),
         output_dir=output_dir,
         fixes_dir=fixes_dir,
         generate_fixes=generate_fixes,
         fix_grouping=fix_grouping,
+        json_entry=json_entry,
+        json_entry_file=json_entry_file,
     )

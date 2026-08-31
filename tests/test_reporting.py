@@ -12,6 +12,7 @@ from mbscan.scan import (
     ScanBatchResult,
     ScanResult,
     ScanSettings,
+    TruncatedRow,
 )
 
 
@@ -86,13 +87,84 @@ def test_render_report_lists_multibyte_samples_and_truncation_notice():
     assert "not shown" in text
 
 
-def test_render_report_includes_mojibake_column_header_in_order():
+def test_render_report_includes_column_headers_in_order():
     columns = [ColumnScan("ID", "VARCHAR2", 0, None)]
     text = render_report(_result(columns))
     header_line = next(line for line in text.splitlines() if line.startswith("Column"))
     assert header_line.split() == [
-        "Column", "Type", "Multibyte", "Mojibake", "Non-ASCII", "Status", "Notes",
+        "Column", "Type", "Multibyte", "Mojibake", "Truncated", "Non-ASCII", "Status", "Notes",
     ]
+
+
+def test_render_report_shows_truncated_count_and_row_details():
+    columns = [
+        ColumnScan(
+            "NAME", "VARCHAR2", 0, None,
+            truncated_count=1,
+            truncated_rows=(
+                TruncatedRow("AAAv1sAAEAAAAB4AAA", 3, "C3", "unexpected end of data"),
+            ),
+        )
+    ]
+
+    text = render_report(_result(columns))
+
+    name_line = next(line for line in text.splitlines() if line.startswith("NAME"))
+    assert name_line.split()[4] == "1"
+    assert "AAAv1sAAEAAAAB4AAA" in text
+    assert "byte 3" in text
+    assert "C3" in text
+    assert "unexpected end of data" in text
+
+
+def test_render_report_truncated_count_none_renders_dash_with_no_detail_lines():
+    columns = [ColumnScan("NAME", "VARCHAR2", 5, None)]
+
+    text = render_report(_result(columns))
+
+    name_line = next(line for line in text.splitlines() if line.startswith("NAME"))
+    assert name_line.split()[4] == "-"
+    assert "incomplete multibyte" not in text
+
+
+def test_render_report_shows_the_partial_multibyte_skip_reason():
+    selected = DbObject("APP", "T1", "TABLE")
+    result = ScanResult(
+        selected=selected,
+        settings=ScanSettings(),
+        dependencies=[],
+        objects=[ObjectScanResult(selected, [], "exhaustive")],
+        truncated_skip_reason=(
+            "partial-multibyte check skipped: database character set WE8MSWIN1252 is not UTF-8"
+        ),
+    )
+
+    text = render_report(result)
+
+    assert "WE8MSWIN1252" in text
+    assert "skipped" in text
+
+
+def test_render_report_shows_object_level_notes():
+    selected = DbObject("APP", "T1", "TABLE")
+    result = ScanResult(
+        selected=selected,
+        settings=ScanSettings(),
+        dependencies=[],
+        objects=[
+            ObjectScanResult(
+                selected,
+                [ColumnScan("TAG", "NVARCHAR2", 0, None)],
+                "exhaustive",
+                notes=("column TAG (NVARCHAR2): partial-multibyte check supports VARCHAR2/CHAR only, skipped",),
+            )
+        ],
+    )
+
+    text = render_report(result)
+
+    assert "NVARCHAR2" in text
+    assert "VARCHAR2/CHAR only" in text
 
 
 def test_render_report_shows_mojibake_count_and_samples_with_truncation():

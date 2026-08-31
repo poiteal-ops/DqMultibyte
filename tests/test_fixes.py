@@ -16,6 +16,7 @@ from mbscan.scan import (
     MOJIBAKE_PREDICATE_TEMPLATE,
     MULTIBYTE_PREDICATE_TEMPLATE,
     ObjectScanResult,
+    TruncatedRow,
 )
 
 
@@ -567,6 +568,125 @@ def test_render_by_row_warns_about_mojibake_rowids_missing_from_the_flagged_set(
     assert "AAAv1sAAEAAAAB4AAA" in update_statements[0]
     assert "UTL_I18N.RAW_TO_CHAR" in update_statements[0]
     assert "AAAv1sAAEAAAAB4AAZ" not in update_statements[0]
+
+
+# --- Partial / truncated multibyte byte-strip ----------------------------
+
+
+def _truncated_col(name="NAME", rows=()):
+    return ColumnScan(name, "VARCHAR2", 0, None, truncated_count=len(rows), truncated_rows=tuple(rows))
+
+
+def test_render_fix_sql_row_grouping_emits_a_byte_strip_update_for_a_truncated_row():
+    obj_result = ObjectScanResult(
+        DbObject("APP", "T1", "TABLE"),
+        [_truncated_col(rows=[TruncatedRow("AAAv1sAAEAAAAB4AAA", 3, "C3", "unexpected end of data")])],
+        "exhaustive",
+    )
+
+    sql = render_fix_sql(obj_result, fix_grouping="row")
+
+    quoted = quote_identifier("NAME")
+    expected = (
+        "UPDATE \"APP\".\"T1\" SET {0} = "
+        "UTL_RAW.CAST_TO_VARCHAR2(UTL_RAW.SUBSTR(UTL_RAW.CAST_TO_RAW({0}), 1, 3)) "
+        "WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');".format(quoted)
+    )
+    update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
+    assert update_statements == [expected]
+
+
+def test_render_fix_sql_row_grouping_truncated_row_with_zero_valid_prefix_sets_null():
+    obj_result = ObjectScanResult(
+        DbObject("APP", "T1", "TABLE"),
+        [_truncated_col(rows=[TruncatedRow("AAAv1sAAEAAAAB4AAA", 0, "80", "invalid start byte")])],
+        "exhaustive",
+    )
+
+    sql = render_fix_sql(obj_result, fix_grouping="row")
+
+    quoted = quote_identifier("NAME")
+    assert (
+        "UPDATE \"APP\".\"T1\" SET {0} = NULL WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');".format(quoted)
+        in sql
+    )
+
+
+def test_render_fix_sql_row_grouping_byte_strip_wins_over_convert_for_a_shared_rowid():
+    """A row that is both LENGTHB>LENGTH multibyte and has a truncated tail
+    must be byte-stripped, not CONVERT-flattened."""
+    rowid = "AAAv1sAAEAAAAB4AAA"
+    obj_result = ObjectScanResult(
+        DbObject("APP", "T1", "TABLE"),
+        [
+            ColumnScan(
+                "NAME", "VARCHAR2", 1, None,
+                flagged_rowids=(rowid,),
+                truncated_count=1,
+                truncated_rows=(TruncatedRow(rowid, 4, "E4 B8", "unexpected end of data"),),
+            )
+        ],
+        "exhaustive",
+    )
+
+    sql = render_fix_sql(obj_result, fix_grouping="row")
+
+    update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
+    assert len(update_statements) == 1
+    assert "UTL_RAW.CAST_TO_RAW" in update_statements[0]
+    assert "CONVERT(" not in update_statements[0]
+
+
+def test_render_fix_sql_column_grouping_emits_a_comment_block_and_no_update_for_truncated():
+    obj_result = ObjectScanResult(
+        DbObject("APP", "T1", "TABLE"),
+        [_truncated_col(rows=[TruncatedRow("AAAv1sAAEAAAAB4AAA", 3, "C3", "unexpected end of data")])],
+        "exhaustive",
+    )
+
+    sql = render_fix_sql(obj_result, fix_grouping="column")
+
+    assert not any(line.startswith("UPDATE ") for line in sql.splitlines())
+    assert "ORA-29275" in sql
+    assert "--fix-grouping row" in sql
+    assert "AAAv1sAAEAAAAB4AAA" in sql
+
+
+def test_render_fix_sql_header_warns_that_the_byte_strip_is_lossy_when_truncated_present():
+    obj_result = ObjectScanResult(
+        DbObject("APP", "T1", "TABLE"),
+        [_truncated_col(rows=[TruncatedRow("AAAv1sAAEAAAAB4AAA", 3, "C3", "unexpected end of data")])],
+        "exhaustive",
+    )
+
+    sql = render_fix_sql(obj_result, fix_grouping="row")
+
+    assert "byte" in sql.lower() and "strip" in sql.lower()
+    assert "DO NOT RUN WITHOUT REVIEW" in sql
+
+
+def test_render_fix_sql_returns_content_for_a_truncated_only_column():
+    obj_result = ObjectScanResult(
+        DbObject("APP", "T1", "TABLE"),
+        [_truncated_col(rows=[TruncatedRow("AAAv1sAAEAAAAB4AAA", 3, "C3", "unexpected end of data")])],
+        "exhaustive",
+    )
+
+    assert render_fix_sql(obj_result, fix_grouping="row") is not None
+
+
+def test_render_fix_sql_row_grouping_skips_a_truncated_rowid_that_fails_format_validation():
+    obj_result = ObjectScanResult(
+        DbObject("APP", "T1", "TABLE"),
+        [_truncated_col(rows=[TruncatedRow("not-a-rowid", 3, "C3", "unexpected end of data")])],
+        "exhaustive",
+    )
+
+    sql = render_fix_sql(obj_result, fix_grouping="row")
+
+    assert "not-a-rowid" not in sql
+    assert not any(line.startswith("UPDATE ") for line in sql.splitlines())
+    assert "WARNING" in sql
 
 
 def test_render_by_row_emits_no_orphan_warning_when_mojibake_rowids_are_a_subset():

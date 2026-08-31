@@ -54,10 +54,65 @@ it.
 | `sample_char_limit` | Max distinct multibyte characters shown per column | `20` |
 | `detect_mojibake` | Also scan for mojibake (SAS DI-style UTF-8-misread-as-Windows-1252 corruption) and report a repaired preview alongside each garbled sample | `false` |
 | `mojibake_sample_limit` | Max flagged rows fetched per column to search for mojibake values | `10` |
+| `detect_truncated` | Detect rows whose stored bytes hold an **incomplete** multibyte character -- the SAS DI "character cut in half" corruption Oracle reports as `ORA-29275: partial multibyte character`. This is the tool's primary purpose, so **when true it is the only check that runs** (multibyte counts, mojibake, and non-ASCII are skipped). `VARCHAR2`/`CHAR` only; self-skips unless the database character set is `AL32UTF8` or `UTF8` | `false` |
+| `json_entry` | Read the exact table+column targets from a JSON manifest instead of `owner`/`object`/`all_objects`. Mutually exclusive with all three and with `--interactive` | `false` |
+| `json_entry_file` | Path to that manifest | `config/scan_targets.json` |
 
 Object names are matched case-insensitively against Oracle's dictionary
 (exact case wins if there's a tie); comma-separated lists are trimmed and
 de-duplicated.
+
+### Partial / truncated multibyte characters (`detect_truncated`)
+
+SAS character variables are sized in **bytes**, not characters, so a DI job
+that resizes or `SUBSTR`s a column can slice a UTF-8 character in the middle
+of its byte sequence. The value loads into Oracle looking fine but later
+raises `ORA-29275` on any read that transcodes it. The other scans can't see
+this: they inspect the value *after* python-oracledb has decoded it, and an
+incomplete sequence can't be decoded. `detect_truncated` instead pulls the
+raw bytes (`UTL_RAW.CAST_TO_RAW`) for every non-ASCII row and validates the
+UTF-8 byte structure in Python. The report lists each flagged ROWID with the
+byte offset, the offending bytes in hex, and the reason -- never the value.
+
+Because catching this corruption is what the tool exists for, **`detect_truncated
+= true` makes it the only check that runs** -- the multibyte `LENGTHB > LENGTH`
+count, mojibake detection, non-ASCII counts, and character sampling are all
+skipped, and those columns show `-` in the report.
+
+In `--fix-grouping row` mode the generated fix script adds a per-ROWID
+byte-strip `UPDATE` (`SET col = UTL_RAW.CAST_TO_VARCHAR2(UTL_RAW.SUBSTR(
+UTL_RAW.CAST_TO_RAW(col), 1, <n>))`), which is **lossy** -- the half
+character and anything after it in that value is discarded (a value broken
+at its first byte becomes `NULL`). `--fix-grouping column` can't express a
+per-row keep-length, so it emits a comment block listing the ROWIDs and no
+`UPDATE`. Exhaustive runs fetch raw bytes for every non-ASCII row of each
+scanned column; use `--row-limit` for a first pass on a large table.
+
+### JSON scan manifest (`json_entry`)
+
+Set `json_entry = true` to scan an explicit list of tables and columns.
+Copy `config/scan_targets.example.json` to `config/scan_targets.json`
+(git-ignored) and edit:
+
+```json
+{
+  "owner": "DQ_TEST",
+  "tables": [
+    { "table": "CUSTOMER_ADDRESSES", "columns": ["ADDRESS_LINE_1", "CITY"] },
+    { "table": "EMPLOYEES", "columns": ["EMAIL"] }
+  ]
+}
+```
+
+- One `owner` for the whole file (single schema per manifest).
+- Omit `columns` (or use `[]`) to scan every text column of that table.
+- A listed column that doesn't exist, or isn't a `CHAR`/`VARCHAR2`/`NCHAR`/
+  `NVARCHAR2` column, is **warned about in the report and skipped** -- the
+  rest of the manifest still runs. An unknown *table* name is a hard error.
+- `json_entry = true` together with `owner`/`object`/`all_objects`/
+  `--interactive` is a configuration error.
+- Table and column names are matched against Oracle's data dictionary before
+  any SQL is built -- the manifest strings are never interpolated directly.
 
 ## CLI usage
 
@@ -103,6 +158,13 @@ mbscan --sample-row-limit 1000 --sample-char-limit 50
 # corruption) and widen how many mojibake rows are sampled per column
 mbscan --detect-mojibake --mojibake-sample-limit 25
 mbscan --no-detect-mojibake
+
+# Also flag rows with an incomplete/truncated multibyte character (ORA-29275)
+mbscan --owner SCOTT --object CUSTOMER_ADDRESSES --detect-truncated --row-limit 100000
+
+# Scan the exact tables/columns listed in config/scan_targets.json
+mbscan --json-entry
+mbscan --json-entry --json-entry-file config/prod_targets.json
 ```
 
 Each run writes:
@@ -138,6 +200,8 @@ expression (`UTL_I18N.RAW_TO_CHAR(UTL_I18N.STRING_TO_RAW(col,
 'WE8MSWIN1252'), 'AL32UTF8')`), which assumes the target schema's database
 character set is `AL32UTF8` -- confirm with `SELECT value FROM
 nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'` if unsure.
+Rows flagged by `detect_truncated` get the byte-strip repair described above
+(row grouping only).
 
 ## Logging
 

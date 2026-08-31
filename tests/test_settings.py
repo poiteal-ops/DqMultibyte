@@ -23,6 +23,9 @@ def _args(**overrides):
         fix_grouping=None,
         detect_mojibake=None,
         mojibake_sample_limit=None,
+        detect_truncated=None,
+        json_entry=None,
+        json_entry_file=None,
     )
     defaults.update(overrides)
     return SimpleNamespace(**defaults)
@@ -255,6 +258,57 @@ def test_resolve_settings_rejects_a_zero_mojibake_sample_limit_from_config():
 def test_resolve_settings_rejects_a_string_mojibake_sample_limit_from_config():
     with pytest.raises(ConfigError, match="mojibake_sample_limit"):
         settings.resolve_settings({"mojibake_sample_limit": "10"}, _args())
+
+
+def test_resolve_settings_defaults_detect_truncated_to_false():
+    resolved = settings.resolve_settings({}, _args())
+
+    assert resolved.scan.detect_truncated is False
+
+
+def test_resolve_settings_uses_configured_detect_truncated():
+    resolved = settings.resolve_settings({"detect_truncated": True}, _args())
+
+    assert resolved.scan.detect_truncated is True
+
+
+def test_resolve_settings_lets_cli_detect_truncated_override_config():
+    resolved = settings.resolve_settings(
+        {"detect_truncated": True}, _args(detect_truncated=False)
+    )
+
+    assert resolved.scan.detect_truncated is False
+
+
+def test_resolve_settings_defaults_json_entry_off_with_the_standard_file(tmp_path):
+    from pathlib import Path
+
+    resolved = settings.resolve_settings({}, _args())
+
+    assert resolved.json_entry is False
+    assert resolved.json_entry_file == Path("config/scan_targets.json")
+
+
+def test_resolve_settings_uses_configured_json_entry_and_file():
+    from pathlib import Path
+
+    resolved = settings.resolve_settings(
+        {"json_entry": True, "json_entry_file": "config/prod_targets.json"}, _args()
+    )
+
+    assert resolved.json_entry is True
+    assert resolved.json_entry_file == Path("config/prod_targets.json")
+
+
+def test_resolve_settings_lets_cli_json_entry_override_config():
+    resolved = settings.resolve_settings({"json_entry": True}, _args(json_entry=False))
+
+    assert resolved.json_entry is False
+
+
+def test_resolve_settings_rejects_a_non_boolean_json_entry():
+    with pytest.raises(ConfigError, match="json_entry"):
+        settings.resolve_settings({"json_entry": "yes"}, _args())
 
 
 @pytest.mark.parametrize(

@@ -7,6 +7,13 @@ owner = "SCOTT"
 # object = "EMPLOYEES,DEPARTMENTS"
 all_objects = false
 
+# Exclusive alternative to owner/object/all_objects: read the exact list of
+# tables and columns to scan from a JSON manifest. When json_entry = true the
+# owner/object/all_objects settings (and --interactive) are rejected -- the
+# owner comes from the manifest. See config/scan_targets.example.json.
+json_entry = false
+# json_entry_file = "config/scan_targets.json"
+
 timeout_seconds = 30
 include_source_tables = false
 # row_limit = 500
@@ -22,3 +29,11 @@ sample_char_limit = 20
 
 detect_mojibake = false
 mojibake_sample_limit = 10
+
+# Detect rows whose stored bytes hold an incomplete multibyte character
+# (SAS-DI "character cut in half"; Oracle raises ORA-29275 reading them).
+# This is the tool's primary purpose, so when true it is the ONLY check that
+# runs -- multibyte counts, mojibake, and non-ASCII are all skipped.
+# Reads the raw bytes via UTL_RAW.CAST_TO_RAW; VARCHAR2/CHAR only; needs a
+# UTF-8 database character set (AL32UTF8 or UTF8) or it self-skips.
+detect_truncated = false
