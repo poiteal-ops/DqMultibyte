@@ -90,6 +90,17 @@ def validate_owner(cursor: Any, owner: str) -> str:
     return resolve_unique_case_insensitive_match(names, owner, "Schema/owner")
 
 
+def database_character_set(cursor: Any) -> str:
+    """Return the database character set (e.g. ``AL32UTF8``), read from
+    ``nls_database_parameters``. Used to decide whether the partial-multibyte
+    check can run and, if so, how strictly to validate byte structure."""
+    cursor.execute(
+        "SELECT value FROM nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'"
+    )
+    row = cursor.fetchone()
+    return row[0] if row else ""
+
+
 def list_exportable_objects(cursor: Any, owner: str) -> List[DbObject]:
     """List visible tables, views, and materialized views for ``owner``.
 

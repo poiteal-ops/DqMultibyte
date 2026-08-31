@@ -20,6 +20,7 @@ from mbscan.oracle.metadata import (
     resolve_requested_objects,
     validate_owner,
 )
+from mbscan.manifest import load_scan_manifest
 from mbscan.settings import resolve_settings
 from mbscan.fixes import write_fix_sql
 from mbscan.reporting import write_report
@@ -59,6 +60,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-char-limit", type=_positive, default=None)
     parser.add_argument("--detect-mojibake", action=argparse.BooleanOptionalAction, default=None)
     parser.add_argument("--mojibake-sample-limit", type=_positive, default=None)
+    parser.add_argument(
+        "--detect-truncated",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="flag rows whose stored bytes hold an incomplete multibyte "
+        "character (SAS-DI truncation; Oracle ORA-29275)",
+    )
+    parser.add_argument(
+        "--json-entry",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="scan only the tables/columns named in the JSON manifest "
+        "(mutually exclusive with --object / --all-objects / --interactive)",
+    )
+    parser.add_argument("--json-entry-file", dest="json_entry_file", type=Path, default=None)
     return parser
 
 
@@ -79,7 +95,21 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         resolved = resolve_settings(load_toml_config(), args)
         if args.interactive and resolved.all_objects:
             raise ConfigError("--interactive cannot be combined with --all-objects")
-        if not args.interactive and (
+        if resolved.json_entry:
+            conflicts = [
+                label
+                for label, present in (
+                    ("--interactive", args.interactive),
+                    ("all_objects", resolved.all_objects),
+                    ("object", bool(resolved.object_names)),
+                )
+                if present
+            ]
+            if conflicts:
+                raise ConfigError(
+                    "json_entry cannot be combined with " + ", ".join(conflicts)
+                )
+        elif not args.interactive and (
             not resolved.owner or (not resolved.all_objects and not resolved.object_names)
         ):
             parser.error("--owner and --object are required (directly, via --interactive, or via config/config.toml)")
@@ -88,17 +118,32 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         logger.info(
             "Resolved settings: all_objects=%s requested_object_count=%s scope=%s row_limit=%s include_non_ascii=%s "
             "timeout_seconds=%s generate_fixes=%s fix_grouping=%s sample_row_limit=%s sample_char_limit=%s "
-            "detect_mojibake=%s mojibake_sample_limit=%s",
+            "detect_mojibake=%s mojibake_sample_limit=%s detect_truncated=%s json_entry=%s",
             resolved.all_objects, len(resolved.object_names), resolved.scan.scope,
             resolved.scan.row_limit, resolved.scan.include_non_ascii, resolved.timeout_seconds,
             resolved.generate_fixes, resolved.fix_grouping,
             resolved.scan.sample_row_limit, resolved.scan.sample_char_limit,
             resolved.scan.detect_mojibake, resolved.scan.mojibake_sample_limit,
+            resolved.scan.detect_truncated, resolved.json_entry,
         )
         config = load_config()
         with connect(config, resolved.timeout_seconds) as connection:
             with connection.cursor() as cursor:
-                if args.interactive:
+                column_filter = None
+                if resolved.json_entry:
+                    manifest = load_scan_manifest(resolved.json_entry_file)
+                    owner = validate_owner(cursor, manifest.owner)
+                    selected_objects = resolve_requested_objects(
+                        cursor, owner, tuple(table.table for table in manifest.tables)
+                    )
+                    column_filter = {
+                        (obj.owner, obj.name, obj.object_type): frozenset(
+                            name.upper() for name in table.columns
+                        )
+                        for table, obj in zip(manifest.tables, selected_objects)
+                        if table.columns
+                    } or None
+                elif args.interactive:
                     owner = validate_owner(cursor, input("Schema [{0}]: ".format(config.username)).strip() or config.username)
                     selected_objects = (_choose_object(cursor, owner),)
                 else:
@@ -115,7 +160,10 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                         print(message)
                         logger.info(message)
                 logger.info("Connected and validated owner %s", owner)
-                result = scan_objects(cursor, selected_objects, resolved.scan, progress=_progress)
+                result = scan_objects(
+                    cursor, selected_objects, resolved.scan,
+                    progress=_progress, column_filter=column_filter,
+                )
                 for obj_result in result.objects:
                     for col in obj_result.columns:
                         logger.info(

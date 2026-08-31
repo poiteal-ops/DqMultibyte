@@ -8,9 +8,12 @@ from mbscan.scan import (
     MojibakeSample,
     MultibyteChar,
     ScanSettings,
+    TRUNCATION_CANDIDATE_PREDICATE_TEMPLATE,
+    TruncatedRow,
     _extract_multibyte_chars,
     _repair_mojibake_samples,
     _scan_one,
+    find_incomplete_utf8,
     safe_object_sql,
     scan_object,
     scan_objects,
@@ -481,6 +484,343 @@ def test_scan_one_fetches_mojibake_rowids_when_capture_mojibake_rowids_is_true()
     assert col.mojibake_rowids == ("AAAv1sAAEAAAAB4AAA", "AAAv1sAAEAAAAB4AAB")
     assert col.mojibake_count == 2
     assert col.mojibake_samples == (MojibakeSample(garbled=garbled, repaired=original),)
+
+
+def test_find_incomplete_utf8_accepts_a_valid_two_byte_sequence():
+    assert find_incomplete_utf8("café".encode("utf-8"), strict=True) is None
+
+
+def test_find_incomplete_utf8_flags_a_lead_byte_cut_off_at_end_of_value():
+    """The SAS-DI signature: 'caf' + a lone 0xC3 -- the second byte of the
+    e-acute sequence was sliced off. The reported offset is the start of the
+    broken sequence, which is also the safe byte length to truncate to."""
+    offset, bad_bytes, reason = find_incomplete_utf8(b"caf\xc3", strict=True)
+
+    assert offset == 3
+    assert bad_bytes == b"\xc3"
+    assert "end of data" in reason
+
+
+def test_find_incomplete_utf8_flags_a_three_byte_sequence_missing_its_last_byte():
+    offset, bad_bytes, reason = find_incomplete_utf8(b"\xe4\xb8", strict=True)
+
+    assert offset == 0
+    assert bad_bytes == b"\xe4\xb8"
+
+
+def test_find_incomplete_utf8_flags_an_orphan_continuation_byte():
+    offset, bad_bytes, _ = find_incomplete_utf8(b"ab\x80cd", strict=True)
+
+    assert offset == 2
+    assert bad_bytes == b"\x80"
+
+
+def test_find_incomplete_utf8_accepts_a_valid_four_byte_sequence_in_both_modes():
+    emoji = "\U0001f4a9".encode("utf-8")
+
+    assert find_incomplete_utf8(emoji, strict=True) is None
+    assert find_incomplete_utf8(emoji, strict=False) is None
+
+
+def test_find_incomplete_utf8_accepts_pure_ascii():
+    assert find_incomplete_utf8(b"hello world", strict=True) is None
+
+
+def test_find_incomplete_utf8_lenient_mode_accepts_a_cesu8_surrogate_pair():
+    """On a UTF8 (CESU-8) database a supplementary character is stored as two
+    3-byte surrogate sequences. Strict UTF-8 rejects them; lenient mode must
+    not, or every emoji row on such a database is a false positive."""
+    cesu8_pile_of_poo = b"\xed\xa0\xbd\xed\xb2\xa9"
+
+    assert find_incomplete_utf8(cesu8_pile_of_poo, strict=False) is None
+    assert find_incomplete_utf8(cesu8_pile_of_poo, strict=True) is not None
+
+
+def test_find_incomplete_utf8_lenient_mode_still_flags_a_truncated_tail():
+    offset, _, reason = find_incomplete_utf8(b"ok\xe4\xb8", strict=False)
+
+    assert offset == 2
+    assert "end of data" in reason
+
+
+def test_scan_one_flags_a_partial_multibyte_row_in_strict_mode():
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "COUNT(*)": [(0,)],
+            "CAST_TO_RAW": [("AAAv1sAAEAAAAB4AAA", b"caf\xc3")],
+        }
+    )
+
+    result = _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(detect_truncated=True),
+        truncation_mode="strict",
+    )
+
+    col = result.columns[0]
+    assert col.truncated_count == 1
+    row = col.truncated_rows[0]
+    assert row.rowid == "AAAv1sAAEAAAAB4AAA"
+    assert row.valid_prefix_bytes == 3
+    assert row.bad_bytes_hex == "C3"
+    assert "end of data" in row.reason
+
+
+def test_truncation_candidate_predicate_catches_both_truncation_shapes():
+    """Verified live against Oracle 23 AL32UTF8: a value ending in a lone lead
+    byte is not seen as a non-ASCII *character* by REGEXP_LIKE, so the regex
+    alone misses trailing truncation -- the exact SAS-DI signature. A
+    mid-string orphan continuation byte, conversely, keeps LENGTHB == LENGTH.
+    The predicate must OR a byte-vs-char length test with the non-ASCII regex
+    so both shapes become candidates."""
+    predicate = TRUNCATION_CANDIDATE_PREDICATE_TEMPLATE.format(quote_identifier("V"))
+
+    assert "LENGTHB(" in predicate and "LENGTH(" in predicate
+    assert "REGEXP_LIKE(" in predicate
+    assert " OR " in predicate
+    # US7ASCII CONVERT must not be used here: it raises ORA-12703 on a value
+    # that holds an incomplete multibyte sequence.
+    assert "US7ASCII" not in predicate
+
+
+def test_detect_truncated_is_exclusive_and_skips_every_other_check():
+    """When detect_truncated is on it is the ONLY thing the scan looks for --
+    no multibyte count, no mojibake, no non-ASCII, no sampling."""
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "COUNT(*)": [(9,)],
+            "CAST_TO_RAW": [("AAAv1sAAEAAAAB4AAA", b"caf\xc3")],
+        }
+    )
+
+    result = _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(
+            detect_truncated=True,
+            detect_mojibake=True,
+            include_non_ascii=True,
+            capture_fix_rowids=True,
+        ),
+        truncation_mode="strict",
+    )
+
+    col = result.columns[0]
+    assert col.truncated_count == 1
+    assert col.multibyte_count is None
+    assert col.mojibake_count is None
+    assert col.non_ascii_count is None
+    assert not any("COUNT(*)" in sql for sql in cursor.executions)
+    assert not any("UNISTR" in sql for sql in cursor.executions)
+    assert not any("SELECT ROWID FROM" in sql for sql in cursor.executions)
+
+
+def test_scan_one_partial_multibyte_ignores_valid_multibyte_rows():
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "COUNT(*)": [(0,)],
+            "CAST_TO_RAW": [
+                ("r1", "café".encode("utf-8")),
+                ("r2", "日本語".encode("utf-8")),
+            ],
+        }
+    )
+
+    result = _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(detect_truncated=True),
+        truncation_mode="strict",
+    )
+
+    col = result.columns[0]
+    assert col.truncated_count == 0
+    assert col.truncated_rows == ()
+
+
+def test_scan_one_default_detect_truncated_false_runs_no_raw_fetch():
+    """Regression guard: with the flag off, no UTL_RAW fetch is issued and
+    the new fields stay at their inert defaults."""
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "COUNT(*)": [(0,)],
+        }
+    )
+
+    result = _scan_one(cursor, DbObject("APP", "T1", "TABLE"), ScanSettings())
+
+    col = result.columns[0]
+    assert col.truncated_count is None
+    assert col.truncated_rows == ()
+    assert not any("CAST_TO_RAW" in sql for sql in cursor.executions)
+
+
+def test_scan_one_partial_multibyte_skips_nvarchar2_columns_with_a_note():
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("VALUE", "NVARCHAR2")],
+            "COUNT(*)": [(0,)],
+        }
+    )
+
+    result = _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(detect_truncated=True),
+        truncation_mode="strict",
+    )
+
+    assert result.columns[0].truncated_count is None
+    assert any("NVARCHAR2" in note for note in result.notes)
+    assert not any("CAST_TO_RAW" in sql for sql in cursor.executions)
+
+
+def test_scan_objects_skips_partial_multibyte_check_on_a_non_utf8_database():
+    cursor = FakeCursor(
+        {
+            "nls_database_parameters": [("WE8MSWIN1252",)],
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "COUNT(*)": [(0,)],
+        }
+    )
+
+    result = scan_objects(
+        cursor, [DbObject("APP", "T1", "TABLE")], ScanSettings(detect_truncated=True)
+    )
+
+    assert "WE8MSWIN1252" in result.truncated_skip_reason
+    assert result.objects[0].columns[0].truncated_count is None
+    assert not any("CAST_TO_RAW" in sql for sql in cursor.executions)
+
+
+def test_scan_objects_runs_partial_multibyte_check_in_strict_mode_for_al32utf8():
+    cursor = FakeCursor(
+        {
+            "nls_database_parameters": [("AL32UTF8",)],
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "COUNT(*)": [(0,)],
+            "CAST_TO_RAW": [("r1", b"\xe4\xb8")],
+        }
+    )
+
+    result = scan_objects(
+        cursor, [DbObject("APP", "T1", "TABLE")], ScanSettings(detect_truncated=True)
+    )
+
+    col = result.objects[0].columns[0]
+    assert col.truncated_count == 1
+    assert result.charset == "AL32UTF8"
+    assert result.truncated_skip_reason is None
+
+
+def test_scan_objects_partial_multibyte_lenient_mode_accepts_cesu8_on_a_utf8_database():
+    cursor = FakeCursor(
+        {
+            "nls_database_parameters": [("UTF8",)],
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "COUNT(*)": [(0,)],
+            "CAST_TO_RAW": [("r1", b"\xed\xa0\xbd\xed\xb2\xa9")],
+        }
+    )
+
+    result = scan_objects(
+        cursor, [DbObject("APP", "T1", "TABLE")], ScanSettings(detect_truncated=True)
+    )
+
+    assert result.objects[0].columns[0].truncated_count == 0
+
+
+def test_scan_one_column_filter_restricts_scanned_columns_to_the_allowlist():
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("NAME", "VARCHAR2"), ("CITY", "VARCHAR2"), ("AGE", "NUMBER")],
+            "COUNT(*)": [(0,)],
+        }
+    )
+
+    result = _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(),
+        column_allowlist=frozenset({"NAME"}),
+    )
+
+    assert [col.name for col in result.columns] == ["NAME"]
+
+
+def test_scan_one_column_filter_notes_an_unknown_column_and_scans_the_rest():
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("NAME", "VARCHAR2")],
+            "COUNT(*)": [(0,)],
+        }
+    )
+
+    result = _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(),
+        column_allowlist=frozenset({"NAME", "NOPE"}),
+    )
+
+    assert [col.name for col in result.columns] == ["NAME"]
+    assert any("NOPE" in note and "not found" in note for note in result.notes)
+
+
+def test_scan_one_column_filter_notes_a_non_text_column_and_scans_the_rest():
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("NAME", "VARCHAR2"), ("AGE", "NUMBER")],
+            "COUNT(*)": [(0,)],
+        }
+    )
+
+    result = _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(),
+        column_allowlist=frozenset({"NAME", "AGE"}),
+    )
+
+    assert [col.name for col in result.columns] == ["NAME"]
+    assert any("AGE" in note and "NUMBER" in note for note in result.notes)
+
+
+def test_scan_one_without_a_column_filter_scans_every_text_column():
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("NAME", "VARCHAR2"), ("CITY", "VARCHAR2")],
+            "COUNT(*)": [(0,)],
+        }
+    )
+
+    result = _scan_one(cursor, DbObject("APP", "T1", "TABLE"), ScanSettings())
+
+    assert [col.name for col in result.columns] == ["NAME", "CITY"]
+
+
+def test_scan_objects_applies_the_column_filter_keyed_by_object():
+    obj = DbObject("APP", "T1", "TABLE")
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("NAME", "VARCHAR2"), ("CITY", "VARCHAR2")],
+            "COUNT(*)": [(0,)],
+        }
+    )
+
+    result = scan_objects(
+        cursor,
+        [obj],
+        ScanSettings(),
+        column_filter={("APP", "T1", "TABLE"): frozenset({"CITY"})},
+    )
+
+    assert [col.name for col in result.objects[0].columns] == ["CITY"]
 
 
 def test_scan_one_default_detect_mojibake_false_preserves_prior_behavior():

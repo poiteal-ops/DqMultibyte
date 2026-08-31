@@ -8,12 +8,14 @@ dist/
 
 .vscode/
 .idea/
+.claude/
 Thumbs.db
 desktop.ini
 
 .env
 config/.env
 config/config.toml
+config/scan_targets.json
 
 output/logs/*.log
 output/reports/*.txt

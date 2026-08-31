@@ -57,6 +57,15 @@ MOJIBAKE_REPAIR_EXPR_TEMPLATE = (
     "UTL_I18N.RAW_TO_CHAR(UTL_I18N.STRING_TO_RAW({0}, 'WE8MSWIN1252'), 'AL32UTF8')"
 )
 
+# Byte-strip repair for a partial/truncated multibyte character (Oracle
+# ORA-29275). {0} = quoted column, {1} = number of leading bytes to keep
+# (scan.TruncatedRow.valid_prefix_bytes). Lossy: the incomplete character and
+# anything after it in that value is discarded. Only usable per-ROWID -- the
+# keep-length differs from row to row -- so column grouping cannot emit it.
+TRUNCATED_STRIP_EXPR_TEMPLATE = (
+    "UTL_RAW.CAST_TO_VARCHAR2(UTL_RAW.SUBSTR(UTL_RAW.CAST_TO_RAW({0}), 1, {1}))"
+)
+
 # Oracle's extended ROWID external representation: exactly 18 characters
 # from this fixed alphabet. Validated as a whitelist before interpolation
 # into generated SQL text -- defense in depth, consistent with
@@ -92,6 +101,13 @@ def build_fix_path(fixes_dir: Path, owner: str, name: str, timestamp: datetime) 
     return fixes_dir / "{0}_fix_{1}_{2}.sql".format(
         timestamp.strftime(TIMESTAMP_FORMAT), safe_filename_component(owner), safe_filename_component(name)
     )
+
+
+def _valid_truncated_rows(col: ColumnScan):
+    """Truncated rows whose ROWID passes the same whitelist as the multibyte
+    ROWIDs, plus the count that failed it."""
+    valid = [row for row in col.truncated_rows if _ROWID_PATTERN.match(row.rowid)]
+    return valid, len(col.truncated_rows) - len(valid)
 
 
 def _render_by_column(flagged: List[ColumnScan], target: str) -> List[str]:
@@ -147,10 +163,30 @@ def _render_by_column(flagged: List[ColumnScan], target: str) -> List[str]:
                 "UPDATE {0} SET {1} = {2} WHERE {3};".format(target, quoted, repair_expr, mojibake_predicate)
             )
             lines.append("")
-        else:
+        elif (col.multibyte_count or 0) > 0:
             predicate = MULTIBYTE_PREDICATE_TEMPLATE.format(quoted)
             lines.append("-- Column {0}: {1} flagged row(s) at scan time".format(safe_name, col.multibyte_count))
             lines.append("UPDATE {0} SET {1} = CONVERT({1}, 'US7ASCII') WHERE {2};".format(target, quoted, predicate))
+            lines.append("")
+        if col.truncated_count:
+            valid_truncated, _ = _valid_truncated_rows(col)
+            lines.append(
+                "-- Column {0}: {1} row(s) with an incomplete multibyte character (Oracle ORA-29275).".format(
+                    safe_name, col.truncated_count
+                )
+            )
+            lines.append(
+                "-- No UPDATE is generated here: the safe keep-length differs per row. Re-run mbscan"
+            )
+            lines.append(
+                "-- with --fix-grouping row to emit a per-ROWID byte-strip UPDATE. Affected ROWIDs:"
+            )
+            for row in valid_truncated:
+                lines.append(
+                    "--   {0}  (keep first {1} byte(s); bad bytes {2} -- {3})".format(
+                        row.rowid, row.valid_prefix_bytes, row.bad_bytes_hex, row.reason
+                    )
+                )
             lines.append("")
     return lines
 
@@ -168,18 +204,39 @@ def _render_by_row(flagged: List[ColumnScan], target: str) -> List[str]:
     rowid_to_assignments: "Dict[str, List[Tuple[str, str]]]" = {}
     for col in flagged:
         safe_name = _escape_for_comment(col.name)
-        lines.append("-- Column {0}: {1} flagged row(s) at scan time".format(safe_name, col.multibyte_count))
+        multibyte_count = col.multibyte_count or 0
+        if multibyte_count:
+            lines.append(
+                "-- Column {0}: {1} flagged row(s) at scan time".format(safe_name, multibyte_count)
+            )
+        if col.truncated_count:
+            lines.append(
+                "-- Column {0}: {1} incomplete multibyte row(s) at scan time (byte-strip)".format(
+                    safe_name, col.truncated_count
+                )
+            )
         valid_rowids = [rowid for rowid in col.flagged_rowids if _ROWID_PATTERN.match(rowid)]
         invalid_count = len(col.flagged_rowids) - len(valid_rowids)
-        if not valid_rowids:
+        valid_truncated, truncated_invalid = _valid_truncated_rows(col)
+        if multibyte_count and not valid_rowids and not valid_truncated:
             lines.append(
                 "-- WARNING: Column {0} was flagged ({1} row(s)) but no ROWIDs were captured; "
-                "skipping this column.".format(safe_name, col.multibyte_count)
+                "skipping this column.".format(safe_name, multibyte_count)
+            )
+        elif multibyte_count and not valid_rowids:
+            lines.append(
+                "-- WARNING: Column {0} had {1} multibyte row(s) with no captured ROWIDs; only the "
+                "byte-strip rows below are fixed.".format(safe_name, multibyte_count)
             )
         elif invalid_count:
             lines.append(
                 "-- WARNING: Column {0} had {1} ROWID(s) that failed format validation and were "
                 "skipped.".format(safe_name, invalid_count)
+            )
+        if truncated_invalid:
+            lines.append(
+                "-- WARNING: Column {0} had {1} incomplete-multibyte ROWID(s) that failed format "
+                "validation and were skipped.".format(safe_name, truncated_invalid)
             )
         # The two ROWID-fetch queries in scan._scan_one are separate
         # statements, each independently bounded by "WHERE ROWNUM <=
@@ -197,12 +254,23 @@ def _render_by_row(flagged: List[ColumnScan], target: str) -> List[str]:
             )
         quoted = quote_identifier(col.name)
         mojibake_rowid_set = set(col.mojibake_rowids)
+        # Byte-strip wins: an incomplete sequence is structural corruption and
+        # must be fixed before (or instead of) a lossy CONVERT of the same row.
+        strip_rowids = {row.rowid for row in valid_truncated}
         for rowid in valid_rowids:
+            if rowid in strip_rowids:
+                continue
             if rowid in mojibake_rowid_set:
                 expr = MOJIBAKE_REPAIR_EXPR_TEMPLATE.format(quoted)
             else:
                 expr = "CONVERT({0}, 'US7ASCII')".format(quoted)
             rowid_to_assignments.setdefault(rowid, []).append((quoted, expr))
+        for row in valid_truncated:
+            if row.valid_prefix_bytes <= 0:
+                expr = "NULL"
+            else:
+                expr = TRUNCATED_STRIP_EXPR_TEMPLATE.format(quoted, row.valid_prefix_bytes)
+            rowid_to_assignments.setdefault(row.rowid, []).append((quoted, expr))
     lines.append("")
     for rowid in sorted(rowid_to_assignments):
         assignments = rowid_to_assignments[rowid]
@@ -219,11 +287,16 @@ def render_fix_sql(obj_result: ObjectScanResult, fix_grouping: str = "row") -> O
     fix_grouping selects the statement shape -- see the module docstring."""
     if fix_grouping not in FIX_GROUPINGS:
         raise ValueError("fix_grouping must be one of {0}, got {1!r}".format(sorted(FIX_GROUPINGS), fix_grouping))
-    flagged = [col for col in obj_result.columns if (col.multibyte_count or 0) > 0]
+    flagged = [
+        col
+        for col in obj_result.columns
+        if (col.multibyte_count or 0) > 0 or (col.truncated_count or 0) > 0
+    ]
     if not flagged:
         return None
     target = safe_object_sql(obj_result.object)
     has_mojibake = any((col.mojibake_count or 0) > 0 for col in flagged)
+    has_truncated = any((col.truncated_count or 0) > 0 for col in flagged)
     mode_description = (
         "one UPDATE per row, all of that row's flagged columns in one SET clause"
         if fix_grouping == "row"
@@ -261,6 +334,20 @@ def render_fix_sql(obj_result: ObjectScanResult, fix_grouping: str = "row") -> O
                 "-- repaired value is still multibyte but no longer mojibake. Running a",
                 "-- column's CONVERT statement after its repair statement would therefore",
                 "-- re-match and lossily flatten the rows the repair had just fixed.",
+                "--",
+            ]
+        )
+    if has_truncated:
+        lines.extend(
+            [
+                "-- INCOMPLETE MULTIBYTE (byte-strip): rows whose stored bytes end in a",
+                "-- half-written multibyte character (SAS-DI truncation; Oracle raises",
+                "-- ORA-29275 reading them) are repaired by stripping back to the last",
+                "-- whole character: SET col = UTL_RAW.CAST_TO_VARCHAR2(UTL_RAW.SUBSTR(",
+                "-- UTL_RAW.CAST_TO_RAW(col), 1, <n>)). This is LOSSY -- the incomplete",
+                "-- character and anything after it in that value is discarded (a value",
+                "-- broken at its first byte becomes NULL). The keep-length is per row,",
+                "-- so these statements appear only in --fix-grouping row output.",
                 "--",
             ]
         )

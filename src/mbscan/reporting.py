@@ -17,12 +17,13 @@ def build_report_path(output_dir: Path, owner: str, name: str, timestamp: dateti
     )
 
 
-def _row_cells(col: ColumnScan) -> Tuple[str, str, str, str, str, str, str]:
+def _row_cells(col: ColumnScan) -> Tuple[str, ...]:
     return (
         col.name,
         col.data_type,
         "-" if col.multibyte_count is None else str(col.multibyte_count),
         "-" if col.mojibake_count is None else str(col.mojibake_count),
+        "-" if col.truncated_count is None else str(col.truncated_count),
         "-" if col.non_ascii_count is None else str(col.non_ascii_count),
         col.status,
         col.reason or "",
@@ -54,6 +55,32 @@ def _preview_value(value: str) -> str:
     return repr(value[:MOJIBAKE_SAMPLE_VALUE_MAX_CHARS]) + " ...(truncated)"
 
 
+# How many flagged ROWIDs to list per column in the partial-multibyte detail
+# block. The block shows only ROWID + byte offset + a few hex bytes + reason,
+# never the value (it can't be decoded and may hold sensitive data).
+TRUNCATED_ROW_PREVIEW_MAX = 20
+
+
+def _render_truncated_rows(col: ColumnScan) -> List[str]:
+    if not col.truncated_rows:
+        return []
+    lines = ["    incomplete multibyte characters in {0}:".format(col.name)]
+    for row in col.truncated_rows[:TRUNCATED_ROW_PREVIEW_MAX]:
+        lines.append(
+            "      ROWID {0} : byte {1} ({2}) -- {3}".format(
+                row.rowid, row.valid_prefix_bytes, row.bad_bytes_hex, row.reason
+            )
+        )
+    remaining = len(col.truncated_rows) - TRUNCATED_ROW_PREVIEW_MAX
+    if remaining > 0:
+        lines.append(
+            "      ({0} more row(s) not shown -- see the generated fix script for the full list)".format(
+                remaining
+            )
+        )
+    return lines
+
+
 def _render_mojibake_samples(col: ColumnScan) -> List[str]:
     if not col.mojibake_samples and not col.mojibake_samples_skipped:
         return []
@@ -73,7 +100,7 @@ def _render_mojibake_samples(col: ColumnScan) -> List[str]:
 
 
 def _render_columns_table(columns: List[ColumnScan]) -> List[str]:
-    headers = ("Column", "Type", "Multibyte", "Mojibake", "Non-ASCII", "Status", "Notes")
+    headers = ("Column", "Type", "Multibyte", "Mojibake", "Truncated", "Non-ASCII", "Status", "Notes")
     rows = [_row_cells(col) for col in columns]
     widths = [len(h) for h in headers]
     for row in rows:
@@ -88,6 +115,7 @@ def _render_columns_table(columns: List[ColumnScan]) -> List[str]:
         lines.append(fmt(row))
         lines.extend(_render_multibyte_samples(col))
         lines.extend(_render_mojibake_samples(col))
+        lines.extend(_render_truncated_rows(col))
     return lines
 
 
@@ -106,11 +134,16 @@ def render_report(result: ScanOutput) -> str:
             ", ".join("{0}.{1}".format(obj.owner, obj.name) for obj in selected)
         )
     lines = [selection_line, "scope: {0}".format(result.settings.scope)]
+    skip_reason = getattr(result, "truncated_skip_reason", None)
+    if skip_reason:
+        lines.append(skip_reason)
     for dep in result.dependencies:
         lines.append("dependency: {0}.{1} {2}".format(dep.object.owner, dep.object.name, dep.access))
     for obj in result.objects:
         lines.append("")
         lines.append("object: {0}.{1} coverage: {2}".format(obj.object.owner, obj.object.name, obj.coverage))
+        for note in getattr(obj, "notes", ()):
+            lines.append("  note: {0}".format(note))
         lines.extend(_render_columns_table(obj.columns))
     return "\n".join(lines) + "\n"
 
