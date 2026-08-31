@@ -8,6 +8,7 @@ from mbscan.scan import (
     MojibakeSample,
     MultibyteChar,
     ScanSettings,
+    TRUNCATION_CANDIDATE_PREDICATE_TEMPLATE,
     TruncatedRow,
     _extract_multibyte_chars,
     _repair_mojibake_samples,
@@ -565,6 +566,23 @@ def test_scan_one_flags_a_partial_multibyte_row_in_strict_mode():
     assert row.valid_prefix_bytes == 3
     assert row.bad_bytes_hex == "C3"
     assert "end of data" in row.reason
+
+
+def test_truncation_candidate_predicate_catches_both_truncation_shapes():
+    """Verified live against Oracle 23 AL32UTF8: a value ending in a lone lead
+    byte is not seen as a non-ASCII *character* by REGEXP_LIKE, so the regex
+    alone misses trailing truncation -- the exact SAS-DI signature. A
+    mid-string orphan continuation byte, conversely, keeps LENGTHB == LENGTH.
+    The predicate must OR a byte-vs-char length test with the non-ASCII regex
+    so both shapes become candidates."""
+    predicate = TRUNCATION_CANDIDATE_PREDICATE_TEMPLATE.format(quote_identifier("V"))
+
+    assert "LENGTHB(" in predicate and "LENGTH(" in predicate
+    assert "REGEXP_LIKE(" in predicate
+    assert " OR " in predicate
+    # US7ASCII CONVERT must not be used here: it raises ORA-12703 on a value
+    # that holds an incomplete multibyte sequence.
+    assert "US7ASCII" not in predicate
 
 
 def test_detect_truncated_is_exclusive_and_skips_every_other_check():

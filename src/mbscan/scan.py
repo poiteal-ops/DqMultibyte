@@ -275,8 +275,21 @@ def _fetch_flagged_rowids(
     return [row[0] for row in cursor.fetchall()]
 
 
+# Candidate rows for the partial-multibyte check: anything that isn't plain
+# 7-bit ASCII. Two conditions are OR'd because neither is sufficient alone
+# (verified live against Oracle 23 AL32UTF8):
+#   - a value ending in a lone lead byte (the SAS-DI signature) is NOT seen
+#     as a non-ASCII character by REGEXP_LIKE, but its byte length exceeds
+#     its character length;
+#   - a mid-string orphan continuation byte keeps LENGTHB == LENGTH, but
+#     REGEXP_LIKE does match it.
+# CONVERT(col, 'US7ASCII') is deliberately not used: it raises ORA-12703 on a
+# value that already holds an incomplete multibyte sequence.
 TRUNCATION_CANDIDATE_PREDICATE_TEMPLATE = (
-    "{0} IS NOT NULL AND REGEXP_LIKE({0}, '[^' || CHR(1) || '-' || CHR(127) || ']')"
+    "{0} IS NOT NULL AND ("
+    "LENGTHB({0}) <> NVL(LENGTH({0}), 0) "
+    "OR REGEXP_LIKE({0}, '[^' || CHR(1) || '-' || CHR(127) || ']')"
+    ")"
 )
 
 
