@@ -1,6 +1,7 @@
 """Aggregate-only Oracle character encoding scans."""
 from __future__ import annotations
 
+import re
 import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Set, Tuple
@@ -56,8 +57,16 @@ _MOJIBAKE_LEAD3_CLASS_SQL = _unistr_class(list(range(0xE0, 0xF0)))
 # rows fall through to the generic multibyte CONVERT bucket instead: lossy,
 # but safe. Re-verified live 2026-08-09: keeps both the 2-byte and 3-byte
 # genuine mojibake cases, excludes the mixed mojibake+CJK case.
+#
+# The leading LENGTH({0}) <= 2000 gate keeps UTL_I18N.STRING_TO_RAW off values
+# whose cp1252 encoding would overflow the 2000-byte SQL RAW limit and raise
+# ORA-06502 (trivial on a VARCHAR2(4000) column). cp1252 is single-byte, so the
+# RAW length equals the character count and LENGTH -- not LENGTHB -- is the
+# exact boundary. An over-length value fails the guard and falls through to the
+# generic CONVERT bucket, the same "lossy, but safe" path described above.
 _MOJIBAKE_CP1252_ROUNDTRIP_GUARD = (
-    "{0} = UTL_I18N.RAW_TO_CHAR(UTL_I18N.STRING_TO_RAW({0}, 'WE8MSWIN1252'), 'WE8MSWIN1252')"
+    "(LENGTH({0}) <= 2000 AND {0} = "
+    "UTL_I18N.RAW_TO_CHAR(UTL_I18N.STRING_TO_RAW({0}, 'WE8MSWIN1252'), 'WE8MSWIN1252'))"
 )
 
 MOJIBAKE_PREDICATE_TEMPLATE = (
@@ -293,42 +302,154 @@ TRUNCATION_CANDIDATE_PREDICATE_TEMPLATE = (
 )
 
 
+# UTL_RAW.CAST_TO_RAW returns the SQL RAW type, capped at 2000 bytes on a
+# non-EXTENDED database. A VARCHAR2(4000) multibyte value easily exceeds that,
+# so calling it inline raises ORA-06502. Values at or under this many bytes are
+# read inline; larger ones are reconstructed byte-window by byte-window with
+# DUMP (see _fetch_row_bytes_via_dump).
+_RAW_INLINE_MAX_BYTES = 2000
+
+# DUMP renders each byte as up to 3 decimal digits plus a comma (<= 4 chars per
+# byte). 900 bytes -> ~3600 chars plus the "Typ=.. Len=.. CharacterSet=..: "
+# header, comfortably under the 4000-byte SQL VARCHAR2 return limit.
+_DUMP_WINDOW_BYTES = 900
+
+# DUMP(col, 1010, ...) header, e.g. "Typ=1 Len=2735 CharacterSet=AL32UTF8".
+# Format code 10 omits the CharacterSet token, so it is optional here.
+_DUMP_HEAD_RE = re.compile(r"^Typ=\d+ Len=\d+( CharacterSet=[\w$#-]+)?$")
+# Comma-separated decimal byte values, or empty when the window is past the end.
+_DUMP_TAIL_RE = re.compile(r"^\d{1,3}(,\d{1,3})*$")
+
+
+def _parse_dump_decimal_bytes(text: Optional[str]) -> Optional[bytes]:
+    """Parse one DUMP(col, 1010|10, ...) result string into bytes, or return
+    None if it is not exactly the expected shape. Never raises: the DUMP output
+    is validated against fixed patterns and every value is range-checked before
+    int()/bytes(), so malformed text can only fail safe."""
+    if text is None:
+        return None
+    head, separator, tail = text.partition(": ")
+    if not separator or not _DUMP_HEAD_RE.match(head):
+        return None
+    tail = tail.strip()
+    if tail == "":
+        return b""
+    if not _DUMP_TAIL_RE.match(tail):
+        return None
+    values = [int(token) for token in tail.split(",")]
+    if any(value < 0 or value > 255 for value in values):
+        return None
+    return bytes(values)
+
+
+def _fetch_row_bytes_via_dump(
+    cursor: Any,
+    base_source: str,
+    quoted_column: str,
+    rowid: str,
+    expected_byte_len: int,
+    notes: List[str],
+) -> Optional[bytes]:
+    """Reconstruct one row's full stored byte sequence with byte-range DUMP
+    windows -- charset-agnostic and byte-addressed, so it survives the
+    incomplete multibyte sequence UTL_RAW.CAST_TO_RAW cannot return without
+    ORA-06502. Returns the bytes, or None (with a scan note) if the output
+    cannot be parsed or the reassembled length disagrees with
+    expected_byte_len; a mismatch means DUMP did not behave byte-for-byte as
+    assumed, so the row is dropped rather than reported wrong."""
+    buffer = bytearray()
+    start = 1  # DUMP start_position is 1-based
+    while start <= expected_byte_len:
+        cursor.execute(
+            "SELECT DUMP({0}, 1010, :start_byte, :len_bytes) FROM {1} "
+            "WHERE ROWID = CHARTOROWID(:rid)".format(quoted_column, base_source),
+            {"start_byte": start, "len_bytes": _DUMP_WINDOW_BYTES, "rid": rowid},
+        )
+        row = cursor.fetchone()
+        chunk = _parse_dump_decimal_bytes(row[0] if row else None)
+        if chunk is None:
+            notes.append(
+                "could not byte-inspect row {0}: DUMP output not in the "
+                "expected format".format(rowid)
+            )
+            return None
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        start += _DUMP_WINDOW_BYTES
+    if len(buffer) != expected_byte_len:
+        notes.append(
+            "could not byte-inspect row {0}: value too large / boundary "
+            "mismatch (expected {1} byte(s), reassembled {2})".format(
+                rowid, expected_byte_len, len(buffer)
+            )
+        )
+        return None
+    return bytes(buffer)
+
+
 def _fetch_truncation_candidates(
-    cursor: Any, obj: DbObject, column: str, limit: Optional[int]
-) -> List[Tuple[str, Any]]:
-    """Fetch (ROWID, raw bytes) for every non-ASCII row, reusing the same
-    row_limit-bounding trick as _fetch_flagged_rowids(). The bytes come back
-    via UTL_RAW.CAST_TO_RAW so python-oracledb hands them over untouched --
-    a value with an incomplete multibyte sequence cannot be decoded to str,
-    which is exactly why the SQL-only checks never see this corruption."""
+    cursor: Any, obj: DbObject, column: str, limit: Optional[int], notes: List[str]
+) -> List[Tuple[str, bytes]]:
+    """Fetch (ROWID, full raw bytes) for every non-ASCII row, reusing the same
+    row_limit-bounding trick as _fetch_flagged_rowids(). Values at or under
+    _RAW_INLINE_MAX_BYTES come back inline via UTL_RAW.CAST_TO_RAW, guarded by a
+    CASE so the cast is never evaluated for a larger value (which would raise
+    ORA-06502); larger values are reconstructed with _fetch_row_bytes_via_dump.
+    python-oracledb hands the RAW bytes over untouched -- a value with an
+    incomplete multibyte sequence cannot be decoded to str, which is exactly
+    why the SQL-only checks never see this corruption."""
     quoted_column = quote_identifier(column)
-    predicate = TRUNCATION_CANDIDATE_PREDICATE_TEMPLATE.format(quoted_column)
+    base_source = safe_object_sql(obj)
     params: dict = {}
-    source = safe_object_sql(obj)
-    raw_expr = "UTL_RAW.CAST_TO_RAW({0})".format(quoted_column)
+    source = base_source
+    col_ref = quoted_column
+    select_expr = "ROWID"
     if limit is not None:
         source = "(SELECT ROWID AS rid, {0} AS v FROM {1} WHERE ROWNUM <= :row_limit)".format(
-            quoted_column, source
+            quoted_column, base_source
         )
+        col_ref = "v"
         select_expr = "rid"
-        predicate = predicate.replace(quoted_column, "v")
-        raw_expr = "UTL_RAW.CAST_TO_RAW(v)"
         params["row_limit"] = limit
-    else:
-        select_expr = "ROWID"
+    predicate = TRUNCATION_CANDIDATE_PREDICATE_TEMPLATE.format(col_ref)
+    inline_raw_expr = "CASE WHEN LENGTHB({0}) <= {1} THEN UTL_RAW.CAST_TO_RAW({0}) END".format(
+        col_ref, _RAW_INLINE_MAX_BYTES
+    )
     cursor.execute(
-        "SELECT {0}, {1} FROM {2} WHERE {3}".format(select_expr, raw_expr, source, predicate),
+        "SELECT {0}, LENGTHB({1}), {2} FROM {3} WHERE {4}".format(
+            select_expr, col_ref, inline_raw_expr, source, predicate
+        ),
         params,
     )
-    return [(row[0], row[1]) for row in cursor.fetchall()]
+    rows = list(cursor.fetchall())
+    out: List[Tuple[str, bytes]] = []
+    for rowid, byte_len, inline_raw in rows:
+        if inline_raw is not None:
+            out.append((rowid, bytes(inline_raw)))
+            continue
+        # inline_raw IS NULL: the predicate already excludes real NULLs, so this
+        # is the CASE guard firing on a value over _RAW_INLINE_MAX_BYTES bytes.
+        full = _fetch_row_bytes_via_dump(
+            cursor, base_source, quoted_column, rowid, int(byte_len or 0), notes
+        )
+        if full is not None:
+            out.append((rowid, full))
+    return out
 
 
 def _detect_truncated_rows(
-    cursor: Any, obj: DbObject, column: str, row_limit: Optional[int], strict: bool
+    cursor: Any,
+    obj: DbObject,
+    column: str,
+    row_limit: Optional[int],
+    strict: bool,
+    notes: List[str],
 ) -> Tuple[TruncatedRow, ...]:
     found: List[TruncatedRow] = []
-    for rowid, raw in _fetch_truncation_candidates(cursor, obj, column, row_limit):
-        raw_bytes = bytes(raw) if raw is not None else b""
+    for rowid, raw_bytes in _fetch_truncation_candidates(
+        cursor, obj, column, row_limit, notes
+    ):
         problem = find_incomplete_utf8(raw_bytes, strict=strict)
         if problem is None:
             continue
@@ -511,7 +632,7 @@ def _scan_one_truncated_only(
     if truncation_mode is not None:
         if data_type in RAW_READABLE_TEXT_TYPES:
             truncated_rows = _detect_truncated_rows(
-                cursor, obj, name, row_limit, truncation_mode == "strict"
+                cursor, obj, name, row_limit, truncation_mode == "strict", notes
             )
             truncated_count = len(truncated_rows)
         else:

@@ -53,18 +53,30 @@ FIX_GROUPINGS = {"row", "column"}
 # and change the charset name here if it differs. Do NOT use
 # CONVERT(col, 'AL32UTF8', 'WE8MSWIN1252') as an alternative: tested against
 # the same instance and confirmed to mangle the data further, not repair it.
+#
+# UTL_I18N.STRING_TO_RAW returns the SQL RAW type (2000-byte cap on a
+# non-EXTENDED database), so this expression only works for values up to 2000
+# characters. scan.MOJIBAKE_PREDICATE_TEMPLATE carries a matching
+# LENGTH(col) <= 2000 gate, so longer values are never flagged as mojibake:
+# they fall through to the lossy CONVERT(col, 'US7ASCII') bucket instead. Exact
+# repair of a >2000-character mojibake value needs a PL/SQL helper and is out
+# of scope here.
 MOJIBAKE_REPAIR_EXPR_TEMPLATE = (
     "UTL_I18N.RAW_TO_CHAR(UTL_I18N.STRING_TO_RAW({0}, 'WE8MSWIN1252'), 'AL32UTF8')"
 )
 
 # Byte-strip repair for a partial/truncated multibyte character (Oracle
 # ORA-29275). {0} = quoted column, {1} = number of leading bytes to keep
-# (scan.TruncatedRow.valid_prefix_bytes). Lossy: the incomplete character and
-# anything after it in that value is discarded. Only usable per-ROWID -- the
-# keep-length differs from row to row -- so column grouping cannot emit it.
-TRUNCATED_STRIP_EXPR_TEMPLATE = (
-    "UTL_RAW.CAST_TO_VARCHAR2(UTL_RAW.SUBSTR(UTL_RAW.CAST_TO_RAW({0}), 1, {1}))"
-)
+# (scan.TruncatedRow.valid_prefix_bytes) -- by construction the byte offset of
+# the first bad byte, i.e. a clean character boundary, so SUBSTRB splits no
+# whole character and does not blank-pad. SUBSTRB returns VARCHAR2, whose SQL
+# return limit is 4000 bytes on a non-EXTENDED database; the earlier
+# UTL_RAW.CAST_TO_RAW form hit the 2000-byte RAW limit and raised ORA-06502 on
+# a VARCHAR2(4000) value. Residual limit: a keep-length still over 4000 bytes
+# (EXTENDED / MAX_STRING_SIZE) is out of scope. Lossy: the incomplete character
+# and anything after it in that value is discarded. Only usable per-ROWID --
+# the keep-length differs from row to row -- so column grouping cannot emit it.
+TRUNCATED_STRIP_EXPR_TEMPLATE = "SUBSTRB({0}, 1, {1})"
 
 # Oracle's extended ROWID external representation: exactly 18 characters
 # from this fixed alphabet. Validated as a whitelist before interpolation
@@ -135,6 +147,10 @@ def _render_by_column(flagged: List[ColumnScan], target: str) -> List[str]:
         safe_name = _escape_for_comment(col.name)
         mojibake_count = col.mojibake_count or 0
         if mojibake_count:
+            # MOJIBAKE_PREDICATE_TEMPLATE carries a LENGTH(col) <= 2000 gate, so
+            # this repair UPDATE never touches a value whose cp1252 encoding
+            # would overflow UTL_I18N.STRING_TO_RAW's 2000-byte RAW limit; longer
+            # values are handled by the CONVERT statement below. See the header.
             mojibake_predicate = MOJIBAKE_PREDICATE_TEMPLATE.format(quoted)
             repair_expr = MOJIBAKE_REPAIR_EXPR_TEMPLATE.format(quoted)
             multibyte_count = col.multibyte_count or 0
@@ -253,6 +269,10 @@ def _render_by_row(flagged: List[ColumnScan], target: str) -> List[str]:
                 )
             )
         quoted = quote_identifier(col.name)
+        # mojibake_rowids only ever holds rows up to 2000 characters -- longer
+        # values fail scan.MOJIBAKE_PREDICATE_TEMPLATE's LENGTH(col) <= 2000
+        # gate (UTL_I18N.STRING_TO_RAW's RAW limit) and so land in valid_rowids
+        # only, taking the lossy CONVERT branch below. See the file header note.
         mojibake_rowid_set = set(col.mojibake_rowids)
         # Byte-strip wins: an incomplete sequence is structural corruption and
         # must be fixed before (or instead of) a lossy CONVERT of the same row.
@@ -329,6 +349,12 @@ def render_fix_sql(obj_result: ObjectScanResult, fix_grouping: str = "row") -> O
                 "-- Still take a backup first: this repair was validated against specific",
                 "-- test cases, not exhaustively against all possible corrupted data.",
                 "--",
+                "-- The repair expression uses UTL_I18N.STRING_TO_RAW, which is limited to",
+                "-- 2000 bytes, so only values up to 2000 characters are flagged as",
+                "-- mojibake. Any longer value is CONVERT-flattened with the lossy",
+                "-- US7ASCII statements instead; repair it by hand if exact recovery is",
+                "-- required.",
+                "--",
                 "-- RUN THE STATEMENTS BELOW IN FILE ORDER. Their WHERE clauses are",
                 "-- evaluated when you run them, not when this file was generated, and a",
                 "-- repaired value is still multibyte but no longer mojibake. Running a",
@@ -343,11 +369,10 @@ def render_fix_sql(obj_result: ObjectScanResult, fix_grouping: str = "row") -> O
                 "-- INCOMPLETE MULTIBYTE (byte-strip): rows whose stored bytes end in a",
                 "-- half-written multibyte character (SAS-DI truncation; Oracle raises",
                 "-- ORA-29275 reading them) are repaired by stripping back to the last",
-                "-- whole character: SET col = UTL_RAW.CAST_TO_VARCHAR2(UTL_RAW.SUBSTR(",
-                "-- UTL_RAW.CAST_TO_RAW(col), 1, <n>)). This is LOSSY -- the incomplete",
-                "-- character and anything after it in that value is discarded (a value",
-                "-- broken at its first byte becomes NULL). The keep-length is per row,",
-                "-- so these statements appear only in --fix-grouping row output.",
+                "-- whole character: SET col = SUBSTRB(col, 1, <n>). This is LOSSY -- the",
+                "-- incomplete character and anything after it in that value is discarded",
+                "-- (a value broken at its first byte becomes NULL). The keep-length is",
+                "-- per row, so these statements appear only in --fix-grouping row output.",
                 "--",
             ]
         )

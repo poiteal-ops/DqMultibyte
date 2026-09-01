@@ -34,6 +34,7 @@ mojibake_sample_limit = 10
 # (SAS-DI "character cut in half"; Oracle raises ORA-29275 reading them).
 # This is the tool's primary purpose, so when true it is the ONLY check that
 # runs -- multibyte counts, mojibake, and non-ASCII are all skipped.
-# Reads the raw bytes via UTL_RAW.CAST_TO_RAW; VARCHAR2/CHAR only; needs a
-# UTF-8 database character set (AL32UTF8 or UTF8) or it self-skips.
+# Reads the raw bytes via UTL_RAW.CAST_TO_RAW (values over 2000 bytes are
+# reconstructed with DUMP); VARCHAR2/CHAR only; needs a UTF-8 database
+# character set (AL32UTF8 or UTF8) or it self-skips.
 detect_truncated = false

@@ -11,6 +11,7 @@ from mbscan.scan import (
     TRUNCATION_CANDIDATE_PREDICATE_TEMPLATE,
     TruncatedRow,
     _extract_multibyte_chars,
+    _parse_dump_decimal_bytes,
     _repair_mojibake_samples,
     _scan_one,
     find_incomplete_utf8,
@@ -307,10 +308,11 @@ def test_mojibake_predicate_template_format_succeeds_with_literal_quantifier():
     constant's own .format() call in _scan_one as a literal {2}, not the
     {{2}} escape it's written with in source.
 
-    The template now references {0} four times (two REGEXP_LIKE branches
-    plus two in the cp1252 round-trip guard); repeated positional references
-    are legal in str.format(), but a single .format(quoted) call must still
-    substitute every one of them without IndexError."""
+    The template now references {0} five times (two REGEXP_LIKE branches plus
+    three in the cp1252 round-trip guard: its LENGTH gate and two in the
+    equality); repeated positional references are legal in str.format(), but a
+    single .format(quoted) call must still substitute every one of them without
+    IndexError."""
     quoted = quote_identifier("X")
 
     predicate = MOJIBAKE_PREDICATE_TEMPLATE.format(quoted)
@@ -318,8 +320,8 @@ def test_mojibake_predicate_template_format_succeeds_with_literal_quantifier():
     assert "{2}" in predicate
     assert "{{2}}" not in predicate
     assert "{0}" not in predicate
-    assert MOJIBAKE_PREDICATE_TEMPLATE.count("{0}") == 4
-    assert predicate.count(quoted) == 4
+    assert MOJIBAKE_PREDICATE_TEMPLATE.count("{0}") == 5
+    assert predicate.count(quoted) == 5
 
 
 def test_mojibake_predicate_template_ands_a_cp1252_roundtrip_guard_onto_both_branches():
@@ -334,7 +336,8 @@ def test_mojibake_predicate_template_ands_a_cp1252_roundtrip_guard_onto_both_bra
     predicate = MOJIBAKE_PREDICATE_TEMPLATE.format(quoted)
 
     guard = (
-        "{0} = UTL_I18N.RAW_TO_CHAR(UTL_I18N.STRING_TO_RAW({0}, 'WE8MSWIN1252'), 'WE8MSWIN1252')"
+        "(LENGTH({0}) <= 2000 AND {0} = "
+        "UTL_I18N.RAW_TO_CHAR(UTL_I18N.STRING_TO_RAW({0}, 'WE8MSWIN1252'), 'WE8MSWIN1252'))"
     ).format(quoted)
     assert predicate.count(guard) == 1
     assert predicate.endswith(guard + ")")
@@ -548,7 +551,7 @@ def test_scan_one_flags_a_partial_multibyte_row_in_strict_mode():
         {
             "all_tab_columns": [("VALUE", "VARCHAR2")],
             "COUNT(*)": [(0,)],
-            "CAST_TO_RAW": [("AAAv1sAAEAAAAB4AAA", b"caf\xc3")],
+            "CAST_TO_RAW": [("AAAv1sAAEAAAAB4AAA", 4, b"caf\xc3")],
         }
     )
 
@@ -592,7 +595,7 @@ def test_detect_truncated_is_exclusive_and_skips_every_other_check():
         {
             "all_tab_columns": [("VALUE", "VARCHAR2")],
             "COUNT(*)": [(9,)],
-            "CAST_TO_RAW": [("AAAv1sAAEAAAAB4AAA", b"caf\xc3")],
+            "CAST_TO_RAW": [("AAAv1sAAEAAAAB4AAA", 4, b"caf\xc3")],
         }
     )
 
@@ -624,8 +627,8 @@ def test_scan_one_partial_multibyte_ignores_valid_multibyte_rows():
             "all_tab_columns": [("VALUE", "VARCHAR2")],
             "COUNT(*)": [(0,)],
             "CAST_TO_RAW": [
-                ("r1", "café".encode("utf-8")),
-                ("r2", "日本語".encode("utf-8")),
+                ("r1", 5, "café".encode("utf-8")),
+                ("r2", 9, "日本語".encode("utf-8")),
             ],
         }
     )
@@ -704,7 +707,7 @@ def test_scan_objects_runs_partial_multibyte_check_in_strict_mode_for_al32utf8()
             "nls_database_parameters": [("AL32UTF8",)],
             "all_tab_columns": [("VALUE", "VARCHAR2")],
             "COUNT(*)": [(0,)],
-            "CAST_TO_RAW": [("r1", b"\xe4\xb8")],
+            "CAST_TO_RAW": [("r1", 2, b"\xe4\xb8")],
         }
     )
 
@@ -724,7 +727,7 @@ def test_scan_objects_partial_multibyte_lenient_mode_accepts_cesu8_on_a_utf8_dat
             "nls_database_parameters": [("UTF8",)],
             "all_tab_columns": [("VALUE", "VARCHAR2")],
             "COUNT(*)": [(0,)],
-            "CAST_TO_RAW": [("r1", b"\xed\xa0\xbd\xed\xb2\xa9")],
+            "CAST_TO_RAW": [("r1", 6, b"\xed\xa0\xbd\xed\xb2\xa9")],
         }
     )
 
@@ -733,6 +736,221 @@ def test_scan_objects_partial_multibyte_lenient_mode_accepts_cesu8_on_a_utf8_dat
     )
 
     assert result.objects[0].columns[0].truncated_count == 0
+
+
+# --- Over-2000-byte partial-multibyte read (ORA-06502 fix) --------------------
+
+
+class _DumpCursor(FakeCursor):
+    """FakeCursor that also answers byte-range DUMP() windows from a stored
+    byte string, honouring the :start_byte / :len_bytes binds so the chunked
+    reconstruction path can be exercised without a real Oracle."""
+
+    def __init__(self, results_by_keyword, dump_bytes=b"", charset="AL32UTF8"):
+        super().__init__(results_by_keyword)
+        self._dump_bytes = dump_bytes
+        self._charset = charset
+
+    def execute(self, sql, parameters=None):
+        if "DUMP(" in sql:
+            self.executions.append(sql)
+            start = parameters["start_byte"]
+            length = parameters["len_bytes"]
+            window = self._dump_bytes[start - 1:start - 1 + length]
+            tail = ",".join(str(byte) for byte in window)
+            self._last_rows = [
+                (
+                    "Typ=1 Len={0} CharacterSet={1}: {2}".format(
+                        len(self._dump_bytes), self._charset, tail
+                    ),
+                )
+            ]
+            return
+        super().execute(sql, parameters)
+
+
+def test_truncation_main_query_guards_cast_to_raw_with_a_lengthb_case():
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "CAST_TO_RAW": [("r1", 4, b"caf\xc3")],
+        }
+    )
+
+    _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(detect_truncated=True),
+        truncation_mode="strict",
+    )
+
+    sql = next(s for s in cursor.executions if "CAST_TO_RAW" in s)
+    assert "CASE WHEN LENGTHB(" in sql
+    assert "<= 2000" in sql
+    assert "UTL_RAW.CAST_TO_RAW(" in sql
+    # One LENGTHB for the projected byte length, one inside the CASE guard.
+    assert sql.count("LENGTHB(") >= 2
+
+
+def test_truncation_reads_small_values_inline_without_dump():
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "CAST_TO_RAW": [("r1", 4, b"caf\xc3")],
+        }
+    )
+
+    result = _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(detect_truncated=True),
+        truncation_mode="strict",
+    )
+
+    col = result.columns[0]
+    assert col.truncated_count == 1
+    assert col.truncated_rows[0].valid_prefix_bytes == 3
+    assert not any("DUMP(" in sql for sql in cursor.executions)
+
+
+def test_truncation_reconstructs_over_limit_value_via_dump_windows():
+    payload = b"a" * 2001 + b"\xc3"  # clean ASCII prefix + lone lead byte
+    cursor = _DumpCursor(
+        {
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            # CASE guard returns NULL for the >2000-byte value.
+            "CAST_TO_RAW": [("r1", len(payload), None)],
+        },
+        dump_bytes=payload,
+    )
+
+    result = _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(detect_truncated=True),
+        truncation_mode="strict",
+    )
+
+    col = result.columns[0]
+    assert col.truncated_count == 1
+    row = col.truncated_rows[0]
+    assert row.valid_prefix_bytes == 2001
+    assert row.bad_bytes_hex == "C3"
+    assert any("DUMP(" in sql for sql in cursor.executions)
+    assert result.notes == ()
+
+
+def test_truncation_over_limit_clean_value_via_dump_reports_no_truncation():
+    payload = "あ".encode("utf-8") * 800  # 2400 bytes, valid UTF-8
+    cursor = _DumpCursor(
+        {
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "CAST_TO_RAW": [("r1", len(payload), None)],
+        },
+        dump_bytes=payload,
+    )
+
+    result = _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(detect_truncated=True),
+        truncation_mode="strict",
+    )
+
+    col = result.columns[0]
+    assert col.truncated_count == 0
+    assert col.truncated_rows == ()
+    assert not any("could not byte-inspect" in note for note in result.notes)
+
+
+def test_truncation_dump_length_mismatch_degrades_row_to_a_note():
+    cursor = _DumpCursor(
+        {
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            # Claimed byte length far exceeds what DUMP can reassemble.
+            "CAST_TO_RAW": [("r1", 5000, None)],
+        },
+        dump_bytes=b"a" * 2400,
+    )
+
+    result = _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(detect_truncated=True),
+        truncation_mode="strict",
+    )
+
+    col = result.columns[0]
+    assert col.truncated_count == 0
+    assert col.truncated_rows == ()
+    assert any("could not byte-inspect row r1" in note for note in result.notes)
+    assert any("boundary mismatch" in note for note in result.notes)
+
+
+def test_parse_dump_decimal_bytes_accepts_valid_output():
+    assert _parse_dump_decimal_bytes("Typ=1 Len=3: 99,97,102") == b"caf"
+    assert (
+        _parse_dump_decimal_bytes("Typ=1 Len=3 CharacterSet=AL32UTF8: 99,97,102")
+        == b"caf"
+    )
+    assert _parse_dump_decimal_bytes("Typ=1 Len=0 CharacterSet=AL32UTF8: ") == b""
+    assert _parse_dump_decimal_bytes("Typ=1 Len=1: 255") == b"\xff"
+
+
+def test_parse_dump_decimal_bytes_rejects_malformed_output():
+    assert _parse_dump_decimal_bytes(None) is None
+    assert _parse_dump_decimal_bytes("garbage") is None
+    assert _parse_dump_decimal_bytes("Typ=1 Len=3 99,97,102") is None  # no ": "
+    assert _parse_dump_decimal_bytes("Typ=1 Len=3: 99,300,1") is None  # byte > 255
+    assert _parse_dump_decimal_bytes("Typ=1 Len=2: 99,9a") is None  # not decimal
+    assert _parse_dump_decimal_bytes("nope: 1,2,3") is None  # bad header
+
+
+def test_truncation_dump_query_binds_rowid_and_offsets_no_identifier_interpolation():
+    payload = b"a" * 2001 + b"\xc3"
+    cursor = _DumpCursor(
+        {
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "CAST_TO_RAW": [("AAAv1sAAEAAAAB4AAA", len(payload), None)],
+        },
+        dump_bytes=payload,
+    )
+
+    _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(detect_truncated=True),
+        truncation_mode="strict",
+    )
+
+    dump_sql = next(s for s in cursor.executions if "DUMP(" in s)
+    assert "WHERE ROWID = CHARTOROWID(:rid)" in dump_sql
+    assert ":start_byte" in dump_sql and ":len_bytes" in dump_sql
+    assert "AAAv1sAAEAAAAB4AAA" not in dump_sql  # rowid is bound, not interpolated
+
+
+def test_truncation_over_limit_path_targets_base_table_not_the_row_limit_wrapper():
+    payload = b"a" * 2001 + b"\xc3"
+    cursor = _DumpCursor(
+        {
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "CAST_TO_RAW": [("r1", len(payload), None)],
+        },
+        dump_bytes=payload,
+    )
+
+    _scan_one(
+        cursor,
+        DbObject("APP", "T1", "TABLE"),
+        ScanSettings(detect_truncated=True, row_limit=100),
+        truncation_mode="strict",
+    )
+
+    main_sql = next(s for s in cursor.executions if "CAST_TO_RAW" in s)
+    assert "ROWNUM <= :row_limit" in main_sql
+    dump_sql = next(s for s in cursor.executions if "DUMP(" in s)
+    assert "ROWNUM" not in dump_sql
+    assert '"APP"."T1"' in dump_sql
 
 
 def test_scan_one_column_filter_restricts_scanned_columns_to_the_allowlist():
