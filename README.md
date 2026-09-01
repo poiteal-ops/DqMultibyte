@@ -70,9 +70,14 @@ of its byte sequence. The value loads into Oracle looking fine but later
 raises `ORA-29275` on any read that transcodes it. The other scans can't see
 this: they inspect the value *after* python-oracledb has decoded it, and an
 incomplete sequence can't be decoded. `detect_truncated` instead pulls the
-raw bytes (`UTL_RAW.CAST_TO_RAW`) for every non-ASCII row and validates the
-UTF-8 byte structure in Python. The report lists each flagged ROWID with the
-byte offset, the offending bytes in hex, and the reason -- never the value.
+raw bytes for every non-ASCII row and validates the UTF-8 byte structure in
+Python. Values up to 2000 bytes come back inline via `UTL_RAW.CAST_TO_RAW`;
+longer ones (a multibyte `VARCHAR2(4000)` easily exceeds the 2000-byte SQL
+`RAW` limit, which used to raise `ORA-06502`) are reconstructed byte-window by
+byte-window with `DUMP`. The report lists each flagged ROWID with the byte
+offset, the offending bytes in hex, and the reason -- never the value. If a
+row's bytes can't be reassembled reliably it is dropped with a note rather
+than reported clean.
 
 Because catching this corruption is what the tool exists for, **`detect_truncated
 = true` makes it the only check that runs** -- the multibyte `LENGTHB > LENGTH`
@@ -80,10 +85,11 @@ count, mojibake detection, non-ASCII counts, and character sampling are all
 skipped, and those columns show `-` in the report.
 
 In `--fix-grouping row` mode the generated fix script adds a per-ROWID
-byte-strip `UPDATE` (`SET col = UTL_RAW.CAST_TO_VARCHAR2(UTL_RAW.SUBSTR(
-UTL_RAW.CAST_TO_RAW(col), 1, <n>))`), which is **lossy** -- the half
-character and anything after it in that value is discarded (a value broken
-at its first byte becomes `NULL`). `--fix-grouping column` can't express a
+byte-strip `UPDATE` (`SET col = SUBSTRB(col, 1, <n>)`), which is **lossy** --
+the half character and anything after it in that value is discarded (a value
+broken at its first byte becomes `NULL`). `SUBSTRB` returns `VARCHAR2`, so it
+works up to 4000 bytes; a keep-length beyond that (`MAX_STRING_SIZE=EXTENDED`)
+is out of scope. `--fix-grouping column` can't express a
 per-row keep-length, so it emits a comment block listing the ROWIDs and no
 `UPDATE`. Exhaustive runs fetch raw bytes for every non-ASCII row of each
 scanned column; use `--row-limit` for a first pass on a large table.
@@ -200,8 +206,11 @@ expression (`UTL_I18N.RAW_TO_CHAR(UTL_I18N.STRING_TO_RAW(col,
 'WE8MSWIN1252'), 'AL32UTF8')`), which assumes the target schema's database
 character set is `AL32UTF8` -- confirm with `SELECT value FROM
 nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'` if unsure.
-Rows flagged by `detect_truncated` get the byte-strip repair described above
-(row grouping only).
+`UTL_I18N.STRING_TO_RAW` is capped at 2000 bytes, so only values up to 2000
+characters are flagged as mojibake; a longer mojibake value falls through to
+the lossy `CONVERT` path instead and needs hand repair if exact recovery
+matters. Rows flagged by `detect_truncated` get the byte-strip repair
+described above (row grouping only).
 
 ## Logging
 

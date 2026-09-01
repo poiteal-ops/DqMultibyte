@@ -7,6 +7,7 @@ from mbscan.oracle.metadata import DbObject, quote_identifier
 from mbscan import fixes
 from mbscan.fixes import (
     MOJIBAKE_REPAIR_EXPR_TEMPLATE,
+    TRUNCATED_STRIP_EXPR_TEMPLATE,
     build_fix_path,
     render_fix_sql,
     write_fix_sql,
@@ -588,8 +589,7 @@ def test_render_fix_sql_row_grouping_emits_a_byte_strip_update_for_a_truncated_r
 
     quoted = quote_identifier("NAME")
     expected = (
-        "UPDATE \"APP\".\"T1\" SET {0} = "
-        "UTL_RAW.CAST_TO_VARCHAR2(UTL_RAW.SUBSTR(UTL_RAW.CAST_TO_RAW({0}), 1, 3)) "
+        "UPDATE \"APP\".\"T1\" SET {0} = SUBSTRB({0}, 1, 3) "
         "WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');".format(quoted)
     )
     update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
@@ -633,8 +633,61 @@ def test_render_fix_sql_row_grouping_byte_strip_wins_over_convert_for_a_shared_r
 
     update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
     assert len(update_statements) == 1
-    assert "UTL_RAW.CAST_TO_RAW" in update_statements[0]
+    assert "SUBSTRB(" in update_statements[0]
     assert "CONVERT(" not in update_statements[0]
+
+
+def test_truncated_strip_expr_is_substrb_and_within_varchar2_limit():
+    """The byte-strip expression must be plain SUBSTRB (VARCHAR2 return, 4000-byte
+    SQL limit) -- not the old UTL_RAW.CAST_TO_RAW form that raised ORA-06502 past
+    2000 bytes."""
+    expr = TRUNCATED_STRIP_EXPR_TEMPLATE.format(quote_identifier("C"), 4000)
+
+    assert expr == 'SUBSTRB("C", 1, 4000)'
+    assert "UTL_RAW" not in expr
+    assert "CAST_TO_RAW" not in expr
+
+
+def test_render_fix_sql_row_grouping_byte_strip_over_2000_bytes_still_one_substrb_update():
+    """Regression: a keep-length above the old 2000-byte RAW cap must still emit
+    a single SUBSTRB UPDATE, not error or split."""
+    obj_result = ObjectScanResult(
+        DbObject("APP", "T1", "TABLE"),
+        [_truncated_col(rows=[TruncatedRow("AAAv1sAAEAAAAB4AAA", 3500, "C3", "unexpected end of data")])],
+        "exhaustive",
+    )
+
+    sql = render_fix_sql(obj_result, fix_grouping="row")
+
+    quoted = quote_identifier("NAME")
+    update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
+    assert update_statements == [
+        "UPDATE \"APP\".\"T1\" SET {0} = SUBSTRB({0}, 1, 3500) "
+        "WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');".format(quoted)
+    ]
+
+
+def test_render_fix_sql_mojibake_header_documents_the_2000_char_repair_ceiling():
+    """The generated script must tell a reviewer that mojibake repair only
+    covers values up to 2000 characters (UTL_I18N.STRING_TO_RAW's RAW limit)."""
+    rowid = "AAAv1sAAEAAAAB4AAA"
+    obj_result = ObjectScanResult(
+        DbObject("APP", "T1", "TABLE"),
+        [
+            ColumnScan(
+                "NAME", "VARCHAR2", 1, None,
+                flagged_rowids=(rowid,),
+                mojibake_count=1,
+                mojibake_rowids=(rowid,),
+            )
+        ],
+        "exhaustive",
+    )
+
+    sql = render_fix_sql(obj_result, fix_grouping="row")
+
+    assert "2000 bytes" in sql
+    assert "2000 characters" in sql
 
 
 def test_render_fix_sql_column_grouping_emits_a_comment_block_and_no_update_for_truncated():
