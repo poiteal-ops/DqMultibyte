@@ -8,7 +8,7 @@ from typing import Any, Callable, Iterable, List, Optional, Sequence, Set, Tuple
 
 import oracledb
 
-from mbscan.progress import progress as object_progress
+from mbscan.progress import progress as object_progress, write_line
 from mbscan.oracle.metadata import DbObject, database_character_set, quote_identifier
 
 # Column types the partial-multibyte check can read via UTL_RAW.CAST_TO_RAW,
@@ -186,6 +186,17 @@ class ScanBatchResult:
     objects: Tuple[ObjectScanResult, ...]
     charset: Optional[str] = None
     truncated_skip_reason: Optional[str] = None
+
+
+# Fired once, right after dependencies/charset are resolved but before any
+# table is scanned, so a caller can start writing a report header without
+# waiting for the whole batch to finish.
+BatchStartCallback = Callable[
+    [Sequence[DbObject], Sequence[Dependency], Optional[str], Optional[str]], None
+]
+# Fired once per table, immediately after that table's scan completes, so a
+# caller can persist results incrementally instead of waiting for the batch.
+ObjectScannedCallback = Callable[[ObjectScanResult], None]
 
 
 def safe_object_sql(obj: DbObject) -> str:
@@ -469,12 +480,31 @@ def _sample_flagged_values(
     cursor: Any,
     obj: DbObject,
     column: str,
+    data_type: str,
     predicate: str,
     row_limit: Optional[int],
     sample_limit: int,
 ) -> List[str]:
     """Fetch up to sample_limit actual values from rows matching predicate,
-    reusing the same row_limit-bounding trick as _count()."""
+    reusing the same row_limit-bounding trick as _count().
+
+    For CHAR/VARCHAR2 (RAW_READABLE_TEXT_TYPES), reads the value as RAW bytes
+    (UTL_RAW.CAST_TO_RAW) rather than letting oracledb auto-decode it to a
+    Python str: a value with an incomplete/invalid multibyte character --
+    exactly what this tool exists to find -- cannot be decoded by the driver
+    itself and previously crashed the whole scan (see
+    _fetch_truncation_candidates for the same problem, solved the same way).
+    Decoded here with errors='replace' so a broken byte span becomes a
+    visible U+FFFD in the sample instead of aborting the run. Values over
+    _RAW_INLINE_MAX_BYTES (RAW's inline cast limit) are skipped rather than
+    reconstructed -- sampling is already a best-effort preview, bounded by
+    sample_row_limit/sample_char_limit, so a handful of oversized values
+    missing from the sample is consistent with that, not a new gap.
+
+    NCHAR/NVARCHAR2 keep the original plain-string fetch: UTL_RAW.CAST_TO_RAW
+    reads the database (not national) character set, so it is not valid for
+    those columns -- same restriction RAW_READABLE_TEXT_TYPES already states
+    for the partial-multibyte check."""
     quoted_column = quote_identifier(column)
     params = {"sample_limit": sample_limit}
     source = safe_object_sql(obj)
@@ -483,11 +513,24 @@ def _sample_flagged_values(
         predicate = predicate.replace(quoted_column, "v")
         quoted_column = "v"
         params["row_limit"] = row_limit
-    sql = "SELECT {col} FROM (SELECT {col} FROM {source} WHERE {predicate}) WHERE ROWNUM <= :sample_limit".format(
-        col=quoted_column, source=source, predicate=predicate
+    if data_type in RAW_READABLE_TEXT_TYPES:
+        select_expr = "CASE WHEN LENGTHB({0}) <= {1} THEN UTL_RAW.CAST_TO_RAW({0}) END".format(
+            quoted_column, _RAW_INLINE_MAX_BYTES
+        )
+        decode_raw = True
+    else:
+        select_expr = quoted_column
+        decode_raw = False
+    sql = "SELECT {expr} FROM (SELECT {col} FROM {source} WHERE {predicate}) WHERE ROWNUM <= :sample_limit".format(
+        expr=select_expr, col=quoted_column, source=source, predicate=predicate
     )
     cursor.execute(sql, params)
-    return [row[0] for row in cursor.fetchall() if row[0] is not None]
+    values: List[str] = []
+    for row in cursor.fetchall():
+        if row[0] is None:
+            continue
+        values.append(bytes(row[0]).decode("utf-8", errors="replace") if decode_raw else row[0])
+    return values
 
 
 def _extract_multibyte_chars(
@@ -694,7 +737,7 @@ def _scan_one(
             samples_truncated = False
             if multi:
                 raw_values = _sample_flagged_values(
-                    cursor, obj, name, predicate, settings.row_limit, settings.sample_row_limit
+                    cursor, obj, name, data_type, predicate, settings.row_limit, settings.sample_row_limit
                 )
                 samples, char_cap_hit = _extract_multibyte_chars(raw_values, settings.sample_char_limit)
                 samples_truncated = char_cap_hit or multi > len(raw_values)
@@ -714,7 +757,8 @@ def _scan_one(
                     mojibake_count = _count(cursor, obj, name, mojibake_predicate, settings.row_limit)
                 if mojibake_count:
                     raw_mojibake_values = _sample_flagged_values(
-                        cursor, obj, name, mojibake_predicate, settings.row_limit, settings.mojibake_sample_limit
+                        cursor, obj, name, data_type, mojibake_predicate,
+                        settings.row_limit, settings.mojibake_sample_limit,
                     )
                     mojibake_samples, repair_truncated, mojibake_samples_skipped = _repair_mojibake_samples(
                         raw_mojibake_values, settings.mojibake_sample_limit
@@ -748,13 +792,20 @@ def scan_objects(
     progress: Optional[ProgressFactory] = None,
     *,
     column_filter: Optional[dict] = None,
+    on_batch_start: Optional[BatchStartCallback] = None,
+    on_object_scanned: Optional[ObjectScannedCallback] = None,
 ) -> ScanBatchResult:
     """Scan selected objects, optionally followed by their accessible source tables.
 
     ``column_filter`` (JSON-manifest mode) maps ``_object_key(obj)`` to a set of
     upper-cased column names; only those columns of that object are scanned.
     Objects with no entry -- including resolved source tables -- are scanned in
-    full, exactly as without a filter."""
+    full, exactly as without a filter.
+
+    ``on_batch_start`` and ``on_object_scanned`` let a caller persist results
+    incrementally (report/log/fixes) as each table finishes, instead of
+    waiting for the whole batch -- the return value is still the complete,
+    in-memory ``ScanBatchResult`` either way."""
     selected_objects = tuple(selected)
     dependencies: List[Dependency] = []
     dependency_keys: Set[Tuple[str, str, str]] = set()
@@ -779,20 +830,30 @@ def scan_objects(
 
     charset, truncation_mode, truncated_skip_reason = _resolve_truncation_mode(cursor, settings)
 
+    if on_batch_start is not None:
+        on_batch_start(selected_objects, tuple(dependencies), charset, truncated_skip_reason)
+
+    total_targets = len(scan_targets)
     scanned_keys: Set[Tuple[str, str, str]] = set()
     results: List[ObjectScanResult] = []
-    for obj in object_progress(scan_targets, total=len(scan_targets), desc="Scanning objects", unit="object"):
+    for index, obj in enumerate(
+        object_progress(scan_targets, total=total_targets, desc="Scanning objects", unit="object"),
+        start=1,
+    ):
         key = _object_key(obj)
         if key in scanned_keys:
             continue
         scanned_keys.add(key)
+        if total_targets > 1:
+            write_line("[{0}/{1}] Scanning {2}.{3}".format(index, total_targets, obj.owner, obj.name))
         allowlist = None if column_filter is None else column_filter.get(key)
-        results.append(
-            _scan_one(
-                cursor, obj, settings, progress,
-                truncation_mode=truncation_mode, column_allowlist=allowlist,
-            )
+        obj_result = _scan_one(
+            cursor, obj, settings, progress,
+            truncation_mode=truncation_mode, column_allowlist=allowlist,
         )
+        results.append(obj_result)
+        if on_object_scanned is not None:
+            on_object_scanned(obj_result)
     return ScanBatchResult(
         selected_objects, settings, tuple(dependencies), tuple(results),
         charset=charset, truncated_skip_reason=truncated_skip_reason,
