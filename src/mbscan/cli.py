@@ -23,7 +23,7 @@ from mbscan.oracle.metadata import (
 from mbscan.manifest import load_scan_manifest
 from mbscan.settings import resolve_settings
 from mbscan.fixes import write_fix_sql
-from mbscan.reporting import write_report
+from mbscan.reporting import start_report
 from mbscan.scan import scan_objects
 
 logger = logging.getLogger(__name__)
@@ -160,31 +160,38 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                         print(message)
                         logger.info(message)
                 logger.info("Connected and validated owner %s", owner)
-                result = scan_objects(
-                    cursor, selected_objects, resolved.scan,
-                    progress=_progress, column_filter=column_filter,
+
+                report_writer = start_report(
+                    selected_objects,
+                    resolved.output_dir,
+                    batch_label="all_objects" if resolved.all_objects and len(selected_objects) > 1 else None,
                 )
-                for obj_result in result.objects:
+                path = report_writer.path
+                fixes_dir = resolved.fixes_dir or resolved.output_dir / "fixes"
+                fix_paths: List[Path] = []
+
+                def _on_batch_start(selected, dependencies, charset, truncated_skip_reason):
+                    report_writer.start(selected, resolved.scan.scope, dependencies, truncated_skip_reason)
+
+                def _on_object_scanned(obj_result):
+                    report_writer.append_object(obj_result)
                     for col in obj_result.columns:
                         logger.info(
                             "column %s.%s.%s: status=%s reason=%s",
                             obj_result.object.owner, obj_result.object.name, col.name, col.status, col.reason,
                         )
-                path = write_report(
-                    result,
-                    resolved.output_dir,
-                    batch_label="all_objects" if resolved.all_objects and len(selected_objects) > 1 else None,
-                )
-                logger.info("Report written")
-
-                fix_paths = []
-                if resolved.generate_fixes:
-                    fixes_dir = resolved.fixes_dir or resolved.output_dir / "fixes"
-                    for obj_result in result.objects:
+                    if resolved.generate_fixes:
                         fix_path = write_fix_sql(obj_result, fixes_dir, fix_grouping=resolved.fix_grouping)
                         if fix_path is not None:
                             fix_paths.append(fix_path)
                             logger.info("Fix script written")
+
+                scan_objects(
+                    cursor, selected_objects, resolved.scan,
+                    progress=_progress, column_filter=column_filter,
+                    on_batch_start=_on_batch_start, on_object_scanned=_on_object_scanned,
+                )
+                logger.info("Report written")
         print("Report written: {0}".format(path))
         for fix_path in fix_paths:
             print("Fix script written: {0}".format(fix_path))
@@ -192,7 +199,9 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         run_complete()
         return 0
     except (ConfigError, ValueError):
-        logger.error("Configuration error")
+        # Full traceback goes to the log file only -- the console message
+        # stays generic so it never echoes a raw config value back out.
+        logger.error("Configuration error", exc_info=True)
         print("Configuration error: invalid or unavailable configuration.")
         return 2
     except oracledb.Error as exc:

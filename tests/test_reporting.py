@@ -58,6 +58,25 @@ def test_render_report_aligns_columns_with_differing_name_lengths():
     assert name_line[second_column_offset:second_column_offset + 8] == "VARCHAR2"
 
 
+def test_render_report_survives_a_multibyte_sample_that_is_an_unpaired_surrogate(tmp_path):
+    """A column value whose underlying bytes were not valid text (e.g. a
+    truncated multibyte character) can come back from the driver as a Python
+    str containing an unpaired surrogate. That string is valid in memory but
+    cannot be UTF-8-encoded on its own -- writing it straight into the report
+    used to raise UnicodeEncodeError (a ValueError subclass) and abort the
+    whole run, wiping out every table's report data that hadn't been written
+    to disk yet. The report must fall back to an escaped form instead."""
+    bad_sample = MultibyteChar(chr(0xD83D), "U+D83D", "UNKNOWN")
+    columns = [ColumnScan("DESCRIPTION", "VARCHAR2", 1, None, multibyte_samples=(bad_sample,))]
+
+    text = render_report(_result(columns))
+
+    assert "\\ud83d" in text
+    # Must be the actual bytes on disk, not just the in-memory string -- this
+    # is where the original bug surfaced.
+    reporting.write_report(_result(columns), tmp_path).read_text(encoding="utf-8")
+
+
 def test_render_report_shows_dash_for_none_counts():
     columns = [ColumnScan("ID", "VARCHAR2", None, None, "error", "Oracle error 904")]
     text = render_report(_result(columns))
@@ -245,6 +264,94 @@ def test_write_report_uses_batch_filename_labels(tmp_path):
 
     assert multiple_path.name.endswith("_report_HR_multiple_objects.txt")
     assert all_path.name.endswith("_report_HR_all_objects.txt")
+
+
+def test_incremental_report_writer_matches_render_report_for_a_batch(tmp_path):
+    """Appending each object's section as it's scanned must produce exactly
+    the same bytes as rendering the whole completed batch at once -- the
+    incremental path is a streaming equivalent of render_report, not a
+    different format."""
+    employees = DbObject("HR", "EMPLOYEES", "TABLE")
+    departments = DbObject("HR", "DEPARTMENTS", "TABLE")
+    employees_result = ObjectScanResult(
+        employees, [ColumnScan("NAME", "VARCHAR2", 3, None)], "exhaustive"
+    )
+    departments_result = ObjectScanResult(departments, [], "exhaustive", notes=("note",))
+
+    batch = ScanBatchResult(
+        selected=(employees, departments),
+        settings=ScanSettings(),
+        dependencies=(),
+        objects=(employees_result, departments_result),
+    )
+
+    writer = reporting.start_report(
+        (employees, departments), tmp_path, datetime(2026, 8, 6, tzinfo=timezone.utc)
+    )
+    writer.start((employees, departments), batch.settings.scope, batch.dependencies, None)
+    writer.append_object(employees_result)
+    writer.append_object(departments_result)
+
+    assert writer.path.read_text(encoding="utf-8") == render_report(batch)
+
+
+def test_incremental_report_writer_creates_parent_directory(tmp_path):
+    nested = tmp_path / "reports" / "nested"
+    writer = reporting.IncrementalReportWriter(nested / "report.txt")
+
+    writer.start((DbObject("APP", "T1", "TABLE"),), "selected", (), None)
+
+    assert writer.path.exists()
+
+
+def test_a_crash_partway_through_a_batch_still_leaves_earlier_tables_on_disk(tmp_path):
+    """The motivating scenario: a multi-table scan that dies partway through
+    (session timeout, Ctrl-C, whatever) must not lose the tables that had
+    already finished -- their sections must already be on disk, appended as
+    each table completed, not held in memory waiting for the whole run."""
+    from mbscan.scan import ScanSettings, scan_objects
+
+    employees = DbObject("HR", "EMPLOYEES", "TABLE")
+    departments = DbObject("HR", "DEPARTMENTS", "TABLE")
+
+    class _CrashingCursor:
+        def execute(self, sql, parameters=None):
+            self._rows = [("NAME", "VARCHAR2")] if "all_tab_columns" in sql else [(0,)]
+
+        def fetchall(self):
+            return self._rows
+
+        def fetchone(self):
+            return self._rows[0]
+
+    writer = reporting.start_report((employees, departments), tmp_path)
+
+    def on_object_scanned(obj_result):
+        writer.append_object(obj_result)
+        if obj_result.object.name == "EMPLOYEES":
+            raise RuntimeError("the database or network closed the connection")
+
+    try:
+        scan_objects(
+            _CrashingCursor(), [employees, departments], ScanSettings(),
+            on_batch_start=lambda selected, deps, charset, skip: writer.start(selected, "selected", deps, skip),
+            on_object_scanned=on_object_scanned,
+        )
+    except RuntimeError:
+        pass
+
+    text = writer.path.read_text(encoding="utf-8")
+    assert "object: HR.EMPLOYEES" in text
+    assert "object: HR.DEPARTMENTS" not in text
+
+
+def test_start_report_builds_the_same_path_as_write_report(tmp_path):
+    selected = (DbObject("HR", "EMPLOYEES", "TABLE"),)
+    timestamp = datetime(2026, 8, 6, tzinfo=timezone.utc)
+
+    writer = reporting.start_report(selected, tmp_path, timestamp)
+
+    assert writer.path == build_report_path(tmp_path, "HR", "EMPLOYEES", timestamp)
 
 
 def test_render_report_truncates_long_mojibake_sample_values():

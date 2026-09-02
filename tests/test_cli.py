@@ -47,19 +47,31 @@ def _stub_successful_run(monkeypatch, obj, connect_spy=None):
     monkeypatch.setattr(cli, "validate_owner", lambda cursor, owner: owner)
     monkeypatch.setattr(cli, "list_exportable_objects", lambda cursor, owner: [obj])
     monkeypatch.setattr(cli, "resolve_requested_objects", lambda cursor, owner, names: (obj,))
-    monkeypatch.setattr(
-        cli, "scan_objects",
-        lambda cursor, selected, settings, progress=None, **kwargs: SimpleNamespace(
-            selected=tuple(selected), settings=settings, dependencies=(), objects=[]
-        ),
-    )
-    monkeypatch.setattr(cli, "write_report", lambda result, output_dir, **kwargs: output_dir / "report.txt")
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
+        _fire_scan_callbacks(kwargs, selected, [])
+        return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
+
+    monkeypatch.setattr(cli, "scan_objects", fake_scan_objects)
     monkeypatch.setattr(cli, "write_fix_sql", lambda obj_result, fixes_dir, **kwargs: None)
     monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name: Path("unused.log"))
 
 
 def _with_config(monkeypatch, config):
     monkeypatch.setattr(cli, "load_toml_config", lambda: config)
+
+
+def _fire_scan_callbacks(kwargs, selected, objects, dependencies=(), charset=None, truncated_skip_reason=None):
+    """Mirror what the real scan_objects does: fire on_batch_start once, then
+    on_object_scanned once per canned per-table result -- so a stand-in
+    scan_objects still exercises the CLI's real report/log/fix-writing paths
+    driven by those callbacks."""
+    on_batch_start = kwargs.get("on_batch_start")
+    if on_batch_start is not None:
+        on_batch_start(tuple(selected), tuple(dependencies), charset, truncated_skip_reason)
+    on_object_scanned = kwargs.get("on_object_scanned")
+    if on_object_scanned is not None:
+        for obj_result in objects:
+            on_object_scanned(obj_result)
 
 
 def test_unknown_flag_is_rejected_by_the_parser():
@@ -111,6 +123,7 @@ def test_run_lets_a_cli_flag_override_one_config_key(monkeypatch, tmp_path):
 
     def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["settings"] = settings
+        _fire_scan_callbacks(kwargs, selected, [])
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
     _stub_successful_run(monkeypatch, obj)
@@ -129,6 +142,7 @@ def test_run_lets_a_cli_flag_override_a_true_config_value_back_to_false(monkeypa
 
     def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["settings"] = settings
+        _fire_scan_callbacks(kwargs, selected, [])
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
     _stub_successful_run(monkeypatch, obj)
@@ -177,6 +191,7 @@ def test_run_resolves_exact_case_match_even_when_a_case_insensitive_duplicate_ex
 
     def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["selected"] = tuple(selected)
+        _fire_scan_callbacks(kwargs, selected, [])
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
     fake_cursor = object()
@@ -190,7 +205,6 @@ def test_run_resolves_exact_case_match_even_when_a_case_insensitive_duplicate_ex
     )
     monkeypatch.setattr(cli, "resolve_requested_objects", lambda cursor, owner, names: (obj,))
     monkeypatch.setattr(cli, "scan_objects", fake_scan_objects)
-    monkeypatch.setattr(cli, "write_report", lambda result, output_dir, **kwargs: output_dir / "report.txt")
     monkeypatch.setattr(cli, "write_fix_sql", lambda obj_result, fixes_dir, **kwargs: None)
     monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name: Path("unused.log"))
     _with_config(monkeypatch, {"owner": "SCOTT", "object": "FOO"})
@@ -226,6 +240,7 @@ def test_run_all_objects_scans_every_exportable_object(monkeypatch, tmp_path):
 
     def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         scanned.extend(selected)
+        _fire_scan_callbacks(kwargs, selected, [])
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
     _stub_successful_run(monkeypatch, first)
@@ -268,6 +283,7 @@ def test_run_resolves_explicit_object_list_and_scans_once_as_a_batch(monkeypatch
     def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["selected"] = tuple(selected)
         captured["progress"] = progress
+        _fire_scan_callbacks(kwargs, selected, [])
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=())
 
     _stub_successful_run(monkeypatch, first)
@@ -289,6 +305,7 @@ def test_multibyte_all_objects_ignores_object_list_and_notifies(monkeypatch, cap
 
     def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["selected"] = tuple(selected)
+        _fire_scan_callbacks(kwargs, selected, [])
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=())
 
     _stub_successful_run(monkeypatch, first)
@@ -336,6 +353,7 @@ def test_run_passes_a_callable_progress_factory_into_scan_objects(monkeypatch, t
 
     def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["progress"] = progress
+        _fire_scan_callbacks(kwargs, selected, [])
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
     _stub_successful_run(monkeypatch, obj)
@@ -406,20 +424,19 @@ def test_run_reports_driver_level_errors_by_full_code_not_zero(monkeypatch, caps
 
 def test_run_derives_fixes_dir_from_output_dir_when_not_given(monkeypatch, tmp_path):
     obj = DbObject("SCOTT", "T1", "TABLE")
-    obj_result = SimpleNamespace(columns=[])
+    obj_result = SimpleNamespace(object=obj, columns=[], coverage="exhaustive", notes=())
     captured = {}
 
     def fake_write_fix_sql(result, fixes_dir, **kwargs):
         captured["fixes_dir"] = fixes_dir
         return None
 
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
+        _fire_scan_callbacks(kwargs, selected, [obj_result])
+        return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[obj_result])
+
     _stub_successful_run(monkeypatch, obj)
-    monkeypatch.setattr(
-        cli, "scan_objects",
-        lambda cursor, selected, settings, progress=None, **kwargs: SimpleNamespace(
-            selected=tuple(selected), settings=settings, dependencies=(), objects=[obj_result]
-        ),
-    )
+    monkeypatch.setattr(cli, "scan_objects", fake_scan_objects)
     monkeypatch.setattr(cli, "write_fix_sql", fake_write_fix_sql)
     _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1"})
 
@@ -431,20 +448,19 @@ def test_run_derives_fixes_dir_from_output_dir_when_not_given(monkeypatch, tmp_p
 
 def test_run_lets_explicit_fixes_dir_override_the_derived_default(monkeypatch, tmp_path):
     obj = DbObject("SCOTT", "T1", "TABLE")
-    obj_result = SimpleNamespace(columns=[])
+    obj_result = SimpleNamespace(object=obj, columns=[], coverage="exhaustive", notes=())
     captured = {}
 
     def fake_write_fix_sql(result, fixes_dir, **kwargs):
         captured["fixes_dir"] = fixes_dir
         return None
 
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
+        _fire_scan_callbacks(kwargs, selected, [obj_result])
+        return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[obj_result])
+
     _stub_successful_run(monkeypatch, obj)
-    monkeypatch.setattr(
-        cli, "scan_objects",
-        lambda cursor, selected, settings, progress=None, **kwargs: SimpleNamespace(
-            selected=tuple(selected), settings=settings, dependencies=(), objects=[obj_result]
-        ),
-    )
+    monkeypatch.setattr(cli, "scan_objects", fake_scan_objects)
     monkeypatch.setattr(cli, "write_fix_sql", fake_write_fix_sql)
     _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1"})
     explicit_fixes_dir = tmp_path / "elsewhere"
@@ -457,14 +473,13 @@ def test_run_lets_explicit_fixes_dir_override_the_derived_default(monkeypatch, t
 
 def test_run_no_generate_fixes_suppresses_all_fix_writing(monkeypatch, tmp_path):
     obj = DbObject("SCOTT", "T1", "TABLE")
-    obj_result = SimpleNamespace(columns=[])
+    obj_result = SimpleNamespace(object=obj, columns=[], coverage="exhaustive", notes=())
+    def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
+        _fire_scan_callbacks(kwargs, selected, [obj_result])
+        return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[obj_result])
+
     _stub_successful_run(monkeypatch, obj)
-    monkeypatch.setattr(
-        cli, "scan_objects",
-        lambda cursor, selected, settings, progress=None, **kwargs: SimpleNamespace(
-            selected=tuple(selected), settings=settings, dependencies=(), objects=[obj_result]
-        ),
-    )
+    monkeypatch.setattr(cli, "scan_objects", fake_scan_objects)
     calls = []
     monkeypatch.setattr(cli, "write_fix_sql", lambda result, fixes_dir, **kwargs: calls.append(result))
     _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1"})
@@ -481,6 +496,7 @@ def test_run_passes_sample_row_and_char_limits_into_scan_settings(monkeypatch, t
 
     def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["settings"] = settings
+        _fire_scan_callbacks(kwargs, selected, [])
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
     _stub_successful_run(monkeypatch, obj)
@@ -518,6 +534,7 @@ def test_run_passes_mojibake_settings_into_scan_settings(monkeypatch, tmp_path):
 
     def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["settings"] = settings
+        _fire_scan_callbacks(kwargs, selected, [])
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
     _stub_successful_run(monkeypatch, obj)
@@ -563,6 +580,7 @@ def test_run_passes_detect_truncated_into_scan_settings(monkeypatch, tmp_path):
 
     def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["settings"] = settings
+        _fire_scan_callbacks(kwargs, selected, [])
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
     _stub_successful_run(monkeypatch, obj)
@@ -585,6 +603,7 @@ def test_run_json_entry_scans_manifest_targets_with_a_column_filter(monkeypatch,
     def fake_scan_objects(cursor, selected, settings, progress=None, **kwargs):
         captured["selected"] = tuple(selected)
         captured["column_filter"] = kwargs.get("column_filter")
+        _fire_scan_callbacks(kwargs, selected, [])
         return SimpleNamespace(selected=tuple(selected), settings=settings, dependencies=(), objects=[])
 
     _stub_successful_run(monkeypatch, t1)

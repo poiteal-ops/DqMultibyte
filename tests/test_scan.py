@@ -152,6 +152,65 @@ def test_scan_objects_includes_every_selected_object_in_order():
     assert result.selected == (employees, departments)
 
 
+def test_scan_objects_fires_on_batch_start_once_before_any_object_is_scanned():
+    employees = DbObject("HR", "EMPLOYEES", "TABLE")
+    departments = DbObject("HR", "DEPARTMENTS", "TABLE")
+    cursor = FakeCursor({"all_tab_columns": [("NAME", "VARCHAR2")], "COUNT(*)": [(0,)]})
+    calls = []
+
+    def on_batch_start(selected, dependencies, charset, truncated_skip_reason):
+        calls.append((selected, dependencies, charset, truncated_skip_reason))
+
+    def on_object_scanned(obj_result):
+        # The batch-start callback must have already fired by the time the
+        # first object finishes, so a caller can rely on the report header
+        # existing before any section is appended to it.
+        assert len(calls) == 1
+
+    scan_objects(
+        cursor, [employees, departments], ScanSettings(),
+        on_batch_start=on_batch_start, on_object_scanned=on_object_scanned,
+    )
+
+    assert calls == [((employees, departments), (), None, None)]
+
+
+def test_scan_objects_fires_on_object_scanned_once_per_object_in_order():
+    employees = DbObject("HR", "EMPLOYEES", "TABLE")
+    departments = DbObject("HR", "DEPARTMENTS", "TABLE")
+    cursor = FakeCursor({"all_tab_columns": [("NAME", "VARCHAR2")], "COUNT(*)": [(0,)]})
+    scanned_names = []
+
+    result = scan_objects(
+        cursor, [employees, departments], ScanSettings(),
+        on_object_scanned=lambda obj_result: scanned_names.append(obj_result.object.name),
+    )
+
+    assert scanned_names == ["EMPLOYEES", "DEPARTMENTS"]
+    assert [item.object.name for item in result.objects] == scanned_names
+
+
+def test_scan_objects_prints_a_line_per_table_when_scanning_more_than_one(capsys):
+    employees = DbObject("HR", "EMPLOYEES", "TABLE")
+    departments = DbObject("HR", "DEPARTMENTS", "TABLE")
+    cursor = FakeCursor({"all_tab_columns": [("NAME", "VARCHAR2")], "COUNT(*)": [(0,)]})
+
+    scan_objects(cursor, [employees, departments], ScanSettings())
+
+    output = capsys.readouterr().out
+    assert "[1/2] Scanning HR.EMPLOYEES" in output
+    assert "[2/2] Scanning HR.DEPARTMENTS" in output
+
+
+def test_scan_objects_does_not_print_a_table_line_for_a_single_object(capsys):
+    employees = DbObject("HR", "EMPLOYEES", "TABLE")
+    cursor = FakeCursor({"all_tab_columns": [("NAME", "VARCHAR2")], "COUNT(*)": [(0,)]})
+
+    scan_objects(cursor, [employees], ScanSettings())
+
+    assert "Scanning HR.EMPLOYEES" not in capsys.readouterr().out
+
+
 def test_scan_object_forwards_progress_to_every_scan_one_call_including_dependencies():
     selected = DbObject("APP", "V1", "VIEW")
     cursor = FakeCursor(
@@ -177,7 +236,7 @@ def test_scan_one_samples_multibyte_characters_when_flagged():
         {
             "all_tab_columns": [("VALUE", "VARCHAR2")],
             "COUNT(*)": [(2,)],
-            "ROWNUM <= :sample_limit": [("Café",), ("日本語",)],
+            "ROWNUM <= :sample_limit": [("Café".encode("utf-8"),), ("日本語".encode("utf-8"),)],
         }
     )
 
@@ -190,6 +249,30 @@ def test_scan_one_samples_multibyte_characters_when_flagged():
     sample_by_char = {sample.char: sample for sample in col.multibyte_samples}
     assert sample_by_char["é"].codepoint == "U+00E9"
     assert sample_by_char["é"].name == "LATIN SMALL LETTER E WITH ACUTE"
+
+
+def test_scan_one_samples_a_value_with_an_incomplete_multibyte_character_without_crashing():
+    """Regression: a value whose raw bytes are invalid UTF-8 (e.g. a
+    truncated multibyte character) cannot be decoded to a Python str by
+    oracledb itself -- fetching it the old way (plain VARCHAR2 SELECT)
+    raised UnicodeDecodeError deep inside the driver and crashed the whole
+    scan. The fix reads the value as RAW bytes and decodes it locally with
+    errors='replace', so the row shows up with a U+FFFD in place of the
+    broken bytes instead of aborting the run."""
+    cursor = FakeCursor(
+        {
+            "all_tab_columns": [("VALUE", "VARCHAR2")],
+            "COUNT(*)": [(1,)],
+            "ROWNUM <= :sample_limit": [(b"caf\xc3",)],  # "caf" + a lone lead byte, cut off
+        }
+    )
+
+    result = _scan_one(cursor, DbObject("APP", "T1", "TABLE"), ScanSettings())
+
+    col = result.columns[0]
+    chars = {sample.char for sample in col.multibyte_samples}
+    assert "�" in chars
+    assert {"c", "a", "f"}.isdisjoint(chars)  # ASCII chars are never counted as multibyte samples
 
 
 def test_scan_one_skips_sampling_when_count_is_zero():
@@ -411,7 +494,7 @@ def test_scan_one_threads_the_skipped_preview_count_onto_the_column_scan():
     cursor = FakeCursor(
         {
             "all_tab_columns": [("VALUE", "VARCHAR2")],
-            "ROWNUM <= :sample_limit": [(garbled,), (unpreviewable,)],
+            "ROWNUM <= :sample_limit": [(garbled.encode("utf-8"),), (unpreviewable.encode("utf-8"),)],
             "UNISTR": [(2,)],
             "COUNT(*)": [(0,)],
         }
@@ -451,7 +534,7 @@ def test_scan_one_samples_and_repairs_mojibake_when_flagged():
     cursor = FakeCursor(
         {
             "all_tab_columns": [("VALUE", "VARCHAR2")],
-            "ROWNUM <= :sample_limit": [(garbled,)],
+            "ROWNUM <= :sample_limit": [(garbled.encode("utf-8"),)],
             "UNISTR": [(1,)],
             "COUNT(*)": [(0,)],
         }
@@ -473,7 +556,7 @@ def test_scan_one_fetches_mojibake_rowids_when_capture_mojibake_rowids_is_true()
             "all_tab_columns": [("VALUE", "VARCHAR2")],
             "COUNT(*)": [(0,)],
             "SELECT ROWID FROM": [("AAAv1sAAEAAAAB4AAA",), ("AAAv1sAAEAAAAB4AAB",)],
-            "ROWNUM <= :sample_limit": [(garbled,)],
+            "ROWNUM <= :sample_limit": [(garbled.encode("utf-8"),)],
         }
     )
 
@@ -1052,7 +1135,7 @@ def test_scan_one_default_detect_mojibake_false_preserves_prior_behavior():
         {
             "all_tab_columns": [("VALUE", "VARCHAR2")],
             "COUNT(*)": [(2,)],
-            "ROWNUM <= :sample_limit": [(accented,), (cjk,)],
+            "ROWNUM <= :sample_limit": [(accented.encode("utf-8"),), (cjk.encode("utf-8"),)],
         }
     )
 

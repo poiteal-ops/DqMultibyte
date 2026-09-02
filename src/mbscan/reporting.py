@@ -30,12 +30,25 @@ def _row_cells(col: ColumnScan) -> Tuple[str, ...]:
     )
 
 
+def _safe_char(ch: str) -> str:
+    """A column value whose raw bytes were not valid text (e.g. a truncated
+    multibyte character) can decode to a Python str containing an unpaired
+    surrogate -- valid in memory, but impossible to write to a UTF-8 file on
+    its own. Fall back to the character's escaped form rather than letting
+    that one bad row crash the whole report write."""
+    try:
+        ch.encode("utf-8")
+        return ch
+    except UnicodeEncodeError:
+        return repr(ch)
+
+
 def _render_multibyte_samples(col: ColumnScan) -> List[str]:
     if not col.multibyte_samples:
         return []
     lines = ["    multibyte characters in {0}:".format(col.name)]
     for sample in col.multibyte_samples:
-        lines.append("      {0}  {1}  {2}".format(sample.char, sample.codepoint, sample.name))
+        lines.append("      {0}  {1}  {2}".format(_safe_char(sample.char), sample.codepoint, sample.name))
     if col.multibyte_samples_truncated:
         lines.append("      (additional distinct characters not shown -- increase sample limits to see more)")
     return lines
@@ -125,27 +138,70 @@ def _selected_objects(result: ScanOutput) -> Tuple:
     return result.selected
 
 
-def render_report(result: ScanOutput) -> str:
-    selected = _selected_objects(result)
+def _header_lines(selected: Tuple, scope: str, dependencies, skip_reason: Optional[str]) -> List[str]:
     if len(selected) == 1:
         selection_line = "selected: {0}.{1}".format(selected[0].owner, selected[0].name)
     else:
         selection_line = "selected objects: {0}".format(
             ", ".join("{0}.{1}".format(obj.owner, obj.name) for obj in selected)
         )
-    lines = [selection_line, "scope: {0}".format(result.settings.scope)]
-    skip_reason = getattr(result, "truncated_skip_reason", None)
+    lines = [selection_line, "scope: {0}".format(scope)]
     if skip_reason:
         lines.append(skip_reason)
-    for dep in result.dependencies:
+    for dep in dependencies:
         lines.append("dependency: {0}.{1} {2}".format(dep.object.owner, dep.object.name, dep.access))
+    return lines
+
+
+def _object_lines(obj) -> List[str]:
+    lines = [
+        "",
+        "object: {0}.{1} coverage: {2}".format(obj.object.owner, obj.object.name, obj.coverage),
+    ]
+    for note in getattr(obj, "notes", ()):
+        lines.append("  note: {0}".format(note))
+    lines.extend(_render_columns_table(obj.columns))
+    return lines
+
+
+def render_report(result: ScanOutput) -> str:
+    selected = _selected_objects(result)
+    lines = _header_lines(
+        selected, result.settings.scope, result.dependencies, getattr(result, "truncated_skip_reason", None)
+    )
     for obj in result.objects:
-        lines.append("")
-        lines.append("object: {0}.{1} coverage: {2}".format(obj.object.owner, obj.object.name, obj.coverage))
-        for note in getattr(obj, "notes", ()):
-            lines.append("  note: {0}".format(note))
-        lines.extend(_render_columns_table(obj.columns))
+        lines.extend(_object_lines(obj))
     return "\n".join(lines) + "\n"
+
+
+class IncrementalReportWriter:
+    """Writes one combined report file for a batch, appending each table's
+    section to disk as soon as that table's scan finishes, so a scan that's
+    interrupted partway through a large schema still leaves a report with
+    every table that had already completed -- instead of nothing at all."""
+
+    def __init__(self, path: Path):
+        self.path = path
+
+    def start(self, selected: Tuple, scope: str, dependencies, skip_reason: Optional[str]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        header = _header_lines(selected, scope, dependencies, skip_reason)
+        self.path.write_text("\n".join(header) + "\n", encoding="utf-8")
+
+    def append_object(self, obj_result) -> None:
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write("\n".join(_object_lines(obj_result)) + "\n")
+
+
+def _report_owner_and_name(selected: Tuple, batch_label: Optional[str]) -> Tuple[str, str]:
+    if not selected:
+        raise ValueError("Cannot write a report without selected objects.")
+    if len(selected) == 1:
+        return selected[0].owner, selected[0].name
+    label = batch_label or "multiple_objects"
+    if label not in {"multiple_objects", "all_objects"}:
+        raise ValueError("batch_label must be multiple_objects or all_objects")
+    return selected[0].owner, label
 
 
 def write_report(
@@ -155,15 +211,7 @@ def write_report(
     batch_label: Optional[str] = None,
 ) -> Path:
     selected = _selected_objects(result)
-    if not selected:
-        raise ValueError("Cannot write a report without selected objects.")
-    if len(selected) == 1:
-        owner, name = selected[0].owner, selected[0].name
-    else:
-        label = batch_label or "multiple_objects"
-        if label not in {"multiple_objects", "all_objects"}:
-            raise ValueError("batch_label must be multiple_objects or all_objects")
-        owner, name = selected[0].owner, label
+    owner, name = _report_owner_and_name(selected, batch_label)
     path = build_report_path(
         output_dir,
         owner,
@@ -173,3 +221,17 @@ def write_report(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(render_report(result), encoding="utf-8")
     return path
+
+
+def start_report(
+    selected: Tuple,
+    output_dir: Path,
+    timestamp: Optional[datetime] = None,
+    batch_label: Optional[str] = None,
+) -> IncrementalReportWriter:
+    """Build the report path up front (before scanning begins) and return a
+    writer whose ``.start()``/``.append_object()`` are filled in as the scan
+    progresses -- see IncrementalReportWriter."""
+    owner, name = _report_owner_and_name(selected, batch_label)
+    path = build_report_path(output_dir, owner, name, timestamp or datetime.now(timezone.utc))
+    return IncrementalReportWriter(path)
