@@ -86,6 +86,7 @@ def configure_logging(
     object_name: str,
     log_dir: Optional[Path] = None,
     timestamp: Optional[datetime] = None,
+    level: int = logging.INFO,
 ) -> Path:
     """Attach a file handler for today's log and return its path.
 
@@ -93,6 +94,10 @@ def configure_logging(
     from a previous call in this process (e.g. a re-run in the same
     interpreter) are closed and removed first, so exactly one handler stays
     attached and each line is written exactly once.
+
+    ``level`` defaults to INFO (prod). Callers pass DEBUG for dev-mode runs
+    (config.toml ``debug_level = "dev"``) to admit any DEBUG-level detail;
+    it does not by itself change what individual log calls choose to record.
     """
     logger = logging.getLogger("mbscan")
     for old_handler in list(logger.handlers):
@@ -111,7 +116,7 @@ def configure_logging(
     formatter.converter = time.gmtime
     handler.setFormatter(formatter)
     handler.addFilter(_RunContextFilter(uuid.uuid4().hex[:4]))
-    logger.setLevel(logging.INFO)
+    logger.setLevel(level)
     logger.addHandler(handler)
     logger.info("Run started")
     return path
