@@ -1,10 +1,12 @@
 # mbscan
 
-Scan an Oracle table/view/materialized view for multibyte and non-ASCII
-character values, and generate a reviewable (never auto-run) fix script.
+Scan an Oracle table/view/materialized view for multibyte, mojibake, and
+truncated-multibyte character corruption (plus optional non-ASCII counts),
+and generate a reviewable (never auto-run) fix script.
 
-Runs on Linux and Windows. No notebook, no other data-quality tooling --
-this is a standalone extraction of the multibyte-scan feature.
+Runs on Linux and Windows, requires Python 3.11+. No notebook, no other
+data-quality tooling -- this is a standalone extraction of the multibyte-scan
+feature.
 
 ## Install
 
@@ -57,6 +59,7 @@ it.
 | `detect_truncated` | Detect rows whose stored bytes hold an **incomplete** multibyte character -- the SAS DI "character cut in half" corruption Oracle reports as `ORA-29275: partial multibyte character`. This is the tool's primary purpose, so **when true it is the only check that runs** (multibyte counts, mojibake, and non-ASCII are skipped). `VARCHAR2`/`CHAR` only; self-skips unless the database character set is `AL32UTF8` or `UTF8` | `false` |
 | `json_entry` | Read the exact table+column targets from a JSON manifest instead of `owner`/`object`/`all_objects`. Mutually exclusive with all three and with `--interactive` | `false` |
 | `json_entry_file` | Path to that manifest | `config/scan_targets.json` |
+| `debug_level` | `"prod"` or `"dev"`. `"dev"` raises the log level to `DEBUG` and lets real error text (Oracle messages, config values, tracebacks) reach the console and log -- local troubleshooting only, see [Logging](#logging). Config-file only, no CLI flag | `"prod"` |
 
 Object names are matched case-insensitively against Oracle's dictionary
 (exact case wins if there's a tie); comma-separated lists are trimmed and
@@ -200,25 +203,81 @@ warning to the console at the start of the run, and the report file itself
 opens with the same warning as its first line, so anyone who only sees the
 report (not this README) still gets it.
 
-**The fix script is generated, never executed.** It contains one
-set-based `UPDATE ... SET col = CONVERT(col, 'US7ASCII') WHERE ...` per
-flagged column -- a lossy, irreversible transliteration to ASCII (characters
-with no ASCII equivalent, like CJK or emoji, become `?`). It's meant to be
-reviewed and run by someone with write access to the scanned tables, after
-taking a backup. Rows flagged as mojibake instead get a non-lossy repair
-expression (`UTL_I18N.RAW_TO_CHAR(UTL_I18N.STRING_TO_RAW(col,
-'WE8MSWIN1252'), 'AL32UTF8')`), which assumes the target schema's database
-character set is `AL32UTF8` -- confirm with `SELECT value FROM
-nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'` if unsure.
-`UTL_I18N.STRING_TO_RAW` is capped at 2000 bytes, so only values up to 2000
-characters are flagged as mojibake; a longer mojibake value falls through to
-the lossy `CONVERT` path instead and needs hand repair if exact recovery
-matters. Rows flagged by `detect_truncated` get the byte-strip repair
-described above (row grouping only).
+**The fix script is generated, never executed.** Every statement is a
+set-based `UPDATE ... WHERE ...`, meant to be reviewed and run by someone
+with write access to the scanned tables, after taking a backup. Which repair
+expression a row or column gets depends on how the scan flagged it. Three
+are emitted:
+
+- **Plain multibyte -> `CONVERT(col, 'US7ASCII')`.** The default, for any
+  flagged row that is neither mojibake nor truncated. A lossy, irreversible
+  transliteration to 7-bit ASCII: recognized accented letters are mapped to
+  a close ASCII equivalent (`é` -> `e`), but any character with no ASCII
+  equivalent -- CJK, emoji -- becomes `?`.
+
+- **Mojibake -> `UTL_I18N.RAW_TO_CHAR(UTL_I18N.STRING_TO_RAW(col,
+  'WE8MSWIN1252'), 'AL32UTF8')`.** A non-lossy, exact repair: it re-encodes
+  the string to the Windows-1252 bytes it was misread as, then decodes those
+  bytes correctly as UTF-8. Assumes the target schema's database character
+  set is `AL32UTF8` -- confirm with `SELECT value FROM
+  nls_database_parameters WHERE parameter = 'NLS_CHARACTERSET'` if unsure.
+  `UTL_I18N.STRING_TO_RAW` returns Oracle's `RAW` type, capped at 2000 bytes
+  on a non-`EXTENDED` database, and the expression inherits that cap. **That
+  2000-character ceiling is a mojibake-only limitation:** a mojibake value
+  longer than 2000 characters is not flagged as mojibake at all and falls
+  through to the `CONVERT` path, which needs hand repair if exact recovery
+  matters.
+
+- **Truncated (`detect_truncated`) -> `SUBSTRB(col, 1, <n>)`.** A byte-strip.
+  It keeps the first `<n>` bytes and discards the rest, where `<n>` is the
+  byte offset of the first broken byte -- by construction a clean character
+  boundary, so no whole character is split and no blank padding is added.
+  This does **not** recover the half character: the missing bytes are gone
+  (a lone lead byte `C3` could have been `é`, `è`, `ç` or many others), so
+  the fix amputates the value at the last intact character and drops the
+  mangled tail. Lossy and irreversible. If the value is broken at its very
+  first byte -- nothing intact to keep -- the row is set to `NULL` instead.
+  No 2000-character *detection* ceiling: over-2000-byte values are
+  byte-window reconstructed with `DUMP` (see the `detect_truncated` section
+  above) and validated in full. `SUBSTRB` returns `VARCHAR2`, so the repair
+  itself works up to 4000 bytes; a keep-length beyond that
+  (`MAX_STRING_SIZE=EXTENDED`) is out of scope. Emitted in `--fix-grouping
+  row` mode only; the keep-length differs per row, so `--fix-grouping column`
+  mode can only list the affected ROWIDs in a comment block with no `UPDATE`.
+
+When one row is flagged more than one way, the byte-strip wins -- an
+incomplete byte sequence is structural corruption that must be resolved
+before any other repair can even read the value.
 
 ## Logging
 
 Every run appends to a daily log file at
-`output/logs/mbscan-<YYYY-MM-DD>.log`. Only object/column metadata and bare
-Oracle error codes are logged -- never credentials or raw Oracle error text,
-which can embed host, port, service name, and schema detail.
+`output/logs/mbscan-<YYYY-MM-DD>.log`, created with restricted permissions.
+One file aggregates every run for that day, so anything written to it
+persists across the whole day's activity.
+
+How much detail is logged (and echoed to the console on failure) is
+controlled by `debug_level` in `config/config.toml`. It is a config-file
+setting only -- there is no CLI flag -- and its values are `"prod"`
+(default) and `"dev"`.
+
+**`prod` (default)** -- log level `INFO`. Oracle failures are recorded as a
+bare `ORA-NNNNN` code only, never Oracle's own message text, which can embed
+host, port, service name, schema, and SQL fragments. Console error output is
+a generic line. One exception: a configuration-error traceback is still
+written to the *log file* (never the console), so a bad config value can
+reach the log even here -- keep the log directory access-controlled.
+
+**`dev`** -- a local-troubleshooting opt-in. Log level is raised to `DEBUG`.
+On failure the console prints the real error detail instead of the generic
+line -- the full Oracle message, or the configuration-error text plus a
+Python traceback -- followed by the log file path. The Oracle message and
+its traceback are written to the log too.
+
+> **Warning: do not set `debug_level = "dev"` outside a local machine you
+> control.** It deliberately disables the redaction that keeps connection
+> details, schema names, SQL fragments, raw config values, and stack traces
+> out of the console and the shared daily log -- and whatever it writes then
+> persists in `output/logs/mbscan-<date>.log` for the rest of the day. Use
+> it only to reproduce a failure locally, then set it back to `"prod"` and
+> delete or rotate that day's log file.
