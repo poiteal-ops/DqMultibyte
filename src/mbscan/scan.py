@@ -3,12 +3,18 @@ from __future__ import annotations
 
 import re
 import unicodedata
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Iterable, List, Optional, Sequence, Set, Tuple
 
 import oracledb
 
 from mbscan.progress import progress as object_progress, write_line
+from mbscan.repair_guards import (
+    ByteFingerprint, CellRepairEvidence, RepairTargetEvidence, dump_window_starts,
+    validate_cell_evidence, window_hash_sql,
+)
+from mbscan.oracle.connection import ConfigError
+from mbscan.oracle.metadata import repair_target_evidence
 from mbscan.oracle.metadata import DbObject, database_character_set, quote_identifier
 
 # Column types the partial-multibyte check can read via UTL_RAW.CAST_TO_RAW,
@@ -157,6 +163,7 @@ class ColumnScan:
     mojibake_samples_skipped: int = 0
     truncated_count: Optional[int] = None
     truncated_rows: Tuple[TruncatedRow, ...] = ()
+    repair_evidence: Tuple[CellRepairEvidence, ...] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True)
@@ -166,6 +173,7 @@ class ObjectScanResult:
     coverage: str
     error_code: Optional[int] = None
     notes: Tuple[str, ...] = ()
+    repair_target: Optional[RepairTargetEvidence] = field(default=None, repr=False)
 
 
 @dataclass(frozen=True)
@@ -641,21 +649,110 @@ def _apply_column_allowlist(
     text_columns = [(name, dt) for name, dt in all_columns if dt in TEXT_TYPES]
     if allowlist is None:
         return text_columns
-    by_upper = {name.upper(): dt for name, dt in all_columns}
-    kept = [(name, dt) for name, dt in text_columns if name.upper() in allowlist]
-    kept_upper = {name.upper() for name, _ in kept}
+    by_exact = {name: (name, data_type) for name, data_type in all_columns}
+    resolved: Set[str] = set()
     for wanted in sorted(allowlist):
-        if wanted in kept_upper:
-            continue
-        if wanted in by_upper:
-            notes.append(
-                "column {0} ({1}): not a scannable text type, skipped".format(wanted, by_upper[wanted])
-            )
-        else:
+        matched = by_exact.get(wanted)
+        if matched is None:
+            candidates = [
+                column for column in all_columns if column[0].upper() == wanted.upper()
+            ]
+            if len(candidates) > 1:
+                matches = ", ".join(repr(name) for name, _ in candidates)
+                raise ConfigError(
+                    "column {0!r} is ambiguous in {1}.{2}; matches {3}".format(
+                        wanted, obj.owner, obj.name, matches
+                    )
+                )
+            matched = candidates[0] if candidates else None
+        if matched is None:
             notes.append(
                 "column {0}: not found in {1}.{2}, skipped".format(wanted, obj.owner, obj.name)
             )
-    return kept
+        elif matched[1] not in TEXT_TYPES:
+            notes.append(
+                "column {0} ({1}): not a scannable text type, skipped".format(
+                    wanted, matched[1]
+                )
+            )
+        else:
+            resolved.add(matched[0])
+    return [(name, data_type) for name, data_type in text_columns if name in resolved]
+
+
+def _capture_repair_column(cursor, obj, name, data_type, settings, truncation_mode, notes):
+    """Classification, marker and complete byte evidence share one SELECT."""
+    if settings.detect_truncated and (truncation_mode is None or data_type not in RAW_READABLE_TEXT_TYPES):
+        return _scan_one_truncated_only(cursor, obj, name, data_type, settings.row_limit, truncation_mode, notes)
+    quoted = quote_identifier(name)
+    source = safe_object_sql(obj)
+    params = {}
+    rid, scn, ref = "ROWID", "ORA_ROWSCN", quoted
+    if settings.row_limit is not None:
+        source = "(SELECT ROWID AS rid, ORA_ROWSCN AS scn, {0} AS v FROM {1} WHERE ROWNUM <= :row_limit)".format(quoted, source)
+        rid, scn, ref = "rid", "scn", "v"
+        params["row_limit"] = settings.row_limit
+    truncated = settings.detect_truncated
+    predicate = (TRUNCATION_CANDIDATE_PREDICATE_TEMPLATE if truncated else MULTIBYTE_PREDICATE_TEMPLATE).format(ref)
+    kind = "CASE WHEN {0} THEN 1 ELSE 0 END".format(MOJIBAKE_PREDICATE_TEMPLATE.format(ref)) if settings.detect_mojibake and not truncated else "0"
+    starts = dump_window_starts(4000)
+    projections = [rid, scn, "LENGTHB({0})".format(ref), kind]
+    for start in starts:
+        projections.append("CASE WHEN LENGTHB({0}) BETWEEN {1} AND 4000 THEN {2} END".format(ref, start, window_hash_sql(ref, start)))
+    if truncated:
+        for start in starts:
+            projections.append("CASE WHEN LENGTHB({0}) BETWEEN {1} AND 4000 THEN DUMP({0}, 1010, {1}, 900) END".format(ref, start))
+    cursor.execute("SELECT {0} FROM {1} WHERE {2}".format(", ".join(projections), source, predicate), params)
+    candidates = list(cursor.fetchall())
+    rowids, mojibake_rowids, strips, evidence = [], [], [], []
+    for row in candidates:
+        rowid, marker, length, is_mojibake = row[:4]
+        problem = None
+        if truncated:
+            if type(length) is int and 1 <= length <= 4000:
+                chunks = [_parse_dump_decimal_bytes(d) for d in row[9:9 + len(dump_window_starts(length))]]
+                raw = b"".join(chunks) if chunks and all(c is not None for c in chunks) else None
+                if raw is None or len(raw) != length:
+                    notes.append("INCONSISTENT_EVIDENCE: byte inspection omitted")
+                    continue
+            else:
+                # Detection retains its wider coverage, but these separate-query
+                # bytes are never evidence for executable row repair.
+                raw = _fetch_row_bytes_via_dump(cursor, safe_object_sql(obj), quoted, rowid, int(length or 0), notes)
+            if raw is None:
+                continue
+            problem = find_incomplete_utf8(raw, strict=truncation_mode == "strict")
+            if problem is None:
+                continue
+            keep, bad, reason = problem
+            strips.append(TruncatedRow(rowid, keep, " ".join("{0:02X}".format(b) for b in bad[:4]), reason))
+        else:
+            rowids.append(rowid)
+            if is_mojibake:
+                mojibake_rowids.append(rowid)
+        if data_type not in RAW_READABLE_TEXT_TYPES:
+            notes.append("UNSUPPORTED_DATATYPE: one finding omitted from guarded repair")
+            continue
+        if type(length) is not int or not 1 <= length <= 4000:
+            notes.append("OVERSIZED_VALUE: one finding omitted from guarded repair")
+            continue
+        if marker is None:
+            notes.append("MISSING_MARKER: one finding omitted from guarded repair")
+            continue
+        cell = CellRepairEvidence(rowid, name, marker,
+            ByteFingerprint(length, tuple(row[4:4 + len(dump_window_starts(length))])),
+            "truncate" if truncated else "mojibake" if is_mojibake else "ascii",
+            problem[0] if problem else None)
+        try:
+            validate_cell_evidence(cell)
+        except (ValueError, TypeError):
+            notes.append("INCONSISTENT_EVIDENCE: one finding omitted from guarded repair")
+            continue
+        evidence.append(cell)
+    return ColumnScan(name, data_type, None if truncated else len(rowids), None,
+        flagged_rowids=tuple(rowids), mojibake_count=len(mojibake_rowids) if settings.detect_mojibake and not truncated else None,
+        mojibake_rowids=tuple(mojibake_rowids), truncated_count=len(strips) if truncated else None,
+        truncated_rows=tuple(strips), repair_evidence=tuple(evidence))
 
 
 def _scan_one_truncated_only(
@@ -703,11 +800,38 @@ def _scan_one(
     columns_meta = _apply_column_allowlist(
         list(_columns(cursor, obj)), column_allowlist, obj, notes
     )
+    repair_target = None
+    if settings.capture_fix_rowids:
+        try:
+            repair_target = repair_target_evidence(cursor, obj, columns_meta)
+        except oracledb.Error:
+            notes.append("MISSING_MARKER_ACCESS: guarded repairs unavailable")
+        if repair_target is None:
+            notes.append("UNSUPPORTED_OBJECT: guarded repairs unavailable")
     iterator = columns_meta if progress is None else progress(
         columns_meta, len(columns_meta), "{0}.{1}".format(obj.owner, obj.name)
     )
     for name, data_type in iterator:
+        captured = None
         try:
+            if repair_target is not None:
+                captured = _capture_repair_column(cursor, obj, name, data_type, settings, truncation_mode, notes)
+                # Samples are only previews; they never supply repair evidence.
+                if not settings.detect_truncated:
+                    quoted = quote_identifier(name)
+                    predicate = MULTIBYTE_PREDICATE_TEMPLATE.format(quoted)
+                    values = _sample_flagged_values(cursor, obj, name, data_type, predicate, settings.row_limit, settings.sample_row_limit) if captured.multibyte_count else []
+                    samples, cap = _extract_multibyte_chars(values, settings.sample_char_limit)
+                    captured = replace(captured, multibyte_samples=samples, multibyte_samples_truncated=cap or (captured.multibyte_count or 0) > len(values))
+                    if settings.include_non_ascii:
+                        captured = replace(captured, non_ascii_count=_count(cursor, obj, name,
+                            "REGEXP_LIKE({0}, '[^' || CHR(1) || '-' || CHR(127) || ']')".format(quoted), settings.row_limit))
+                    if captured.mojibake_count:
+                        values = _sample_flagged_values(cursor, obj, name, data_type, MOJIBAKE_PREDICATE_TEMPLATE.format(quoted), settings.row_limit, settings.mojibake_sample_limit)
+                        samples, cap, skipped = _repair_mojibake_samples(values, settings.mojibake_sample_limit)
+                        captured = replace(captured, mojibake_samples=samples, mojibake_samples_truncated=cap or captured.mojibake_count > len(values), mojibake_samples_skipped=skipped)
+                columns.append(captured)
+                continue
             if settings.detect_truncated:
                 # Exclusive mode: the partial-multibyte check is this tool's
                 # main purpose, so when it is on it is the ONLY thing we run --
@@ -775,9 +899,13 @@ def _scan_one(
                 )
             )
         except oracledb.Error as exc:
-            columns.append(ColumnScan(name, data_type, None, None, "error", "Oracle error {0}".format(_error_code(exc))))
+            if captured is not None:
+                columns.append(captured)
+                notes.append("PREVIEW_UNAVAILABLE: captured repair evidence preserved")
+            else:
+                columns.append(ColumnScan(name, data_type, None, None, "error", "Oracle error {0}".format(_error_code(exc))))
     return ObjectScanResult(
-        obj, columns, "bounded" if settings.row_limit else "exhaustive", notes=tuple(notes)
+        obj, columns, "bounded" if settings.row_limit else "exhaustive", notes=tuple(notes), repair_target=repair_target
     )
 
 
@@ -798,7 +926,7 @@ def scan_objects(
     """Scan selected objects, optionally followed by their accessible source tables.
 
     ``column_filter`` (JSON-manifest mode) maps ``_object_key(obj)`` to a set of
-    upper-cased column names; only those columns of that object are scanned.
+    exact-spelling column names; only those columns of that object are scanned.
     Objects with no entry -- including resolved source tables -- are scanned in
     full, exactly as without a filter.
 

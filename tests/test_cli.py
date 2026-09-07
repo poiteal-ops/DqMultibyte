@@ -1,5 +1,8 @@
 import argparse
 import logging
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -347,6 +350,61 @@ def test_run_reports_a_bad_config_value_as_a_clean_configuration_error(monkeypat
     assert "timeout_seconds" not in captured.out
 
 
+@pytest.mark.parametrize("failure_phase", ["before_logging", "after_logging"])
+def test_production_configuration_errors_hide_details_in_a_fresh_process(tmp_path, failure_phase):
+    sentinel = "SYNTHETIC_SECRET_MARKER"
+    log_dir = tmp_path / "logs"
+    output_dir = tmp_path / "reports"
+    script = textwrap.dedent(
+        """
+        import logging
+        import sys
+        from pathlib import Path
+
+        from mbscan import cli
+        from mbscan.logging_setup import configure_logging
+        from mbscan.oracle.connection import ConfigError
+
+        sentinel = "SYNTHETIC_SECRET_MARKER"
+        logging.getLogger().addHandler(logging.StreamHandler(sys.stderr))
+        phase = sys.argv[1]
+        log_dir = Path(sys.argv[2])
+        output_dir = sys.argv[3]
+
+        if phase == "before_logging":
+            cli.load_toml_config = lambda: {
+                "owner": "SCOTT", "object": "T1", "timeout_seconds": sentinel
+            }
+        else:
+            cli.load_toml_config = lambda: {"owner": "SCOTT", "object": "T1"}
+            cli.configure_logging = lambda owner, object_name, **kwargs: configure_logging(
+                owner, object_name, log_dir=log_dir, **kwargs
+            )
+            def fail_after_logging():
+                raise ConfigError(sentinel)
+            cli.load_config = fail_after_logging
+
+        parser = cli.build_parser()
+        args = parser.parse_args(["--output-dir", output_dir])
+        raise SystemExit(cli.run(args, parser))
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, failure_phase, str(log_dir), str(output_dir)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    log_text = "".join(path.read_text(encoding="utf-8") for path in log_dir.glob("*.log"))
+
+    assert completed.returncode == 2
+    assert "Configuration error: invalid or unavailable configuration." in completed.stdout
+    for disclosed_text in (completed.stdout, completed.stderr, log_text):
+        assert sentinel not in disclosed_text
+        assert "Traceback" not in disclosed_text
+
+
 def test_run_prints_the_real_config_error_in_dev_mode(monkeypatch, capsys, tmp_path):
     """debug_level = "dev" is an explicit opt-in to the detail prod hides."""
     _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1", "timeout_seconds": 0, "debug_level": "dev"})
@@ -367,6 +425,26 @@ def test_run_rejects_an_unknown_debug_level(monkeypatch, capsys, tmp_path):
     captured = capsys.readouterr()
     assert exit_code == 2
     assert "Configuration error: invalid or unavailable configuration." in captured.out
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "all_objects",
+        "include_source_tables",
+        "include_non_ascii",
+        "detect_mojibake",
+        "detect_truncated",
+        "generate_fixes",
+        "json_entry",
+    ],
+)
+def test_run_rejects_non_boolean_settings_before_logging_or_connecting(monkeypatch, key):
+    monkeypatch.setattr(cli, "configure_logging", lambda *a, **k: pytest.fail("must not create log output"))
+    monkeypatch.setattr(cli, "connect", lambda *a, **k: pytest.fail("must not connect"))
+    _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1", key: "false"})
+
+    assert _run([]) == 2
 
 
 def test_run_passes_a_callable_progress_factory_into_scan_objects(monkeypatch, tmp_path):
@@ -680,7 +758,7 @@ def test_run_json_entry_scans_manifest_targets_with_a_column_filter(monkeypatch,
         lambda path: ScanManifest(
             owner="DQ_TEST",
             tables=(
-                ManifestTable("CUSTOMER_ADDRESSES", ("CITY",)),
+                ManifestTable("CUSTOMER_ADDRESSES", ("City",)),
                 ManifestTable("EMPLOYEES", ()),
             ),
         ),
@@ -692,7 +770,7 @@ def test_run_json_entry_scans_manifest_targets_with_a_column_filter(monkeypatch,
     assert exit_code == 0
     assert captured["selected"] == (t1, t2)
     assert captured["column_filter"] == {
-        ("DQ_TEST", "CUSTOMER_ADDRESSES", "TABLE"): frozenset({"CITY"})
+        ("DQ_TEST", "CUSTOMER_ADDRESSES", "TABLE"): frozenset({"City"})
     }
 
 

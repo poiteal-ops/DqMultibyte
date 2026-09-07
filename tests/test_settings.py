@@ -329,6 +329,48 @@ def test_resolve_settings_rejects_a_non_boolean_json_entry():
 
 
 @pytest.mark.parametrize(
+    "key",
+    [
+        "all_objects",
+        "include_source_tables",
+        "include_non_ascii",
+        "detect_mojibake",
+        "detect_truncated",
+        "generate_fixes",
+        "json_entry",
+    ],
+)
+@pytest.mark.parametrize("bad_value", ["false", "true", 0, 1, [], {}])
+def test_resolve_settings_rejects_every_non_boolean_boolean_setting(key, bad_value):
+    """Removing validation for any boolean would accept one of these malformed values."""
+    with pytest.raises(ConfigError, match=key):
+        settings.resolve_settings({key: bad_value}, _args())
+
+
+def test_resolve_settings_preserves_false_for_every_boolean_setting():
+    resolved = settings.resolve_settings(
+        {
+            "all_objects": False,
+            "include_source_tables": False,
+            "include_non_ascii": False,
+            "detect_mojibake": False,
+            "detect_truncated": False,
+            "generate_fixes": False,
+            "json_entry": False,
+        },
+        _args(),
+    )
+
+    assert resolved.all_objects is False
+    assert resolved.scan.scope == "selected"
+    assert resolved.scan.include_non_ascii is False
+    assert resolved.scan.detect_mojibake is False
+    assert resolved.scan.detect_truncated is False
+    assert resolved.generate_fixes is False
+    assert resolved.json_entry is False
+
+
+@pytest.mark.parametrize(
     "generate_fixes, fix_grouping, detect_mojibake, expected",
     [
         (True, "row", True, True),

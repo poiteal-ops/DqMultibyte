@@ -33,8 +33,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from mbscan.files import TIMESTAMP_FORMAT, safe_filename_component, secure_chmod_file, secure_mkdir
+from mbscan.files import TIMESTAMP_FORMAT, safe_filename_component, artifact_suffix, open_private_text
 from mbscan.oracle.metadata import quote_identifier
+from mbscan.guarded_sql import render_guarded_rows
 from mbscan.scan import (
     ColumnScan,
     MOJIBAKE_PREDICATE_TEMPLATE,
@@ -110,15 +111,15 @@ def _escape_for_comment(text: str) -> str:
 
 
 def build_fix_path(fixes_dir: Path, owner: str, name: str, timestamp: datetime) -> Path:
-    return fixes_dir / "{0}_fix_{1}_{2}.sql".format(
-        timestamp.strftime(TIMESTAMP_FORMAT), safe_filename_component(owner), safe_filename_component(name)
+    return fixes_dir / "{0}_fix_{1}_{2}_{3}.sql".format(
+        timestamp.strftime(TIMESTAMP_FORMAT), safe_filename_component(owner), safe_filename_component(name), artifact_suffix(owner, name)
     )
 
 
 def _valid_truncated_rows(col: ColumnScan):
     """Truncated rows whose ROWID passes the same whitelist as the multibyte
     ROWIDs, plus the count that failed it."""
-    valid = [row for row in col.truncated_rows if _ROWID_PATTERN.match(row.rowid)]
+    valid = [row for row in col.truncated_rows if _ROWID_PATTERN.fullmatch(row.rowid)]
     return valid, len(col.truncated_rows) - len(valid)
 
 
@@ -204,98 +205,6 @@ def _render_by_column(flagged: List[ColumnScan], target: str) -> List[str]:
                     )
                 )
             lines.append("")
-    return lines
-
-
-def _render_by_row(flagged: List[ColumnScan], target: str) -> List[str]:
-    """One UPDATE per ROWID captured at scan time, consolidating every
-    flagged column for that row into a single SET clause.
-
-    Within a column, a rowid that's also in that column's mojibake_rowids
-    gets the mojibake repair expression instead of the lossy CONVERT
-    fallback -- so a single row's UPDATE can end up with one repaired column
-    and one converted column, if that row has two flagged columns and only
-    one of them is mojibake."""
-    lines: List[str] = []
-    rowid_to_assignments: "Dict[str, List[Tuple[str, str]]]" = {}
-    for col in flagged:
-        safe_name = _escape_for_comment(col.name)
-        multibyte_count = col.multibyte_count or 0
-        if multibyte_count:
-            lines.append(
-                "-- Column {0}: {1} flagged row(s) at scan time".format(safe_name, multibyte_count)
-            )
-        if col.truncated_count:
-            lines.append(
-                "-- Column {0}: {1} incomplete multibyte row(s) at scan time (byte-strip)".format(
-                    safe_name, col.truncated_count
-                )
-            )
-        valid_rowids = [rowid for rowid in col.flagged_rowids if _ROWID_PATTERN.match(rowid)]
-        invalid_count = len(col.flagged_rowids) - len(valid_rowids)
-        valid_truncated, truncated_invalid = _valid_truncated_rows(col)
-        if multibyte_count and not valid_rowids and not valid_truncated:
-            lines.append(
-                "-- WARNING: Column {0} was flagged ({1} row(s)) but no ROWIDs were captured; "
-                "skipping this column.".format(safe_name, multibyte_count)
-            )
-        elif multibyte_count and not valid_rowids:
-            lines.append(
-                "-- WARNING: Column {0} had {1} multibyte row(s) with no captured ROWIDs; only the "
-                "byte-strip rows below are fixed.".format(safe_name, multibyte_count)
-            )
-        elif invalid_count:
-            lines.append(
-                "-- WARNING: Column {0} had {1} ROWID(s) that failed format validation and were "
-                "skipped.".format(safe_name, invalid_count)
-            )
-        if truncated_invalid:
-            lines.append(
-                "-- WARNING: Column {0} had {1} incomplete-multibyte ROWID(s) that failed format "
-                "validation and were skipped.".format(safe_name, truncated_invalid)
-            )
-        # The two ROWID-fetch queries in scan._scan_one are separate
-        # statements, each independently bounded by "WHERE ROWNUM <=
-        # :row_limit" with no ORDER BY, so under a row_limit-bounded scan
-        # Oracle does not guarantee they saw the same first-N rows. A
-        # mojibake ROWID missing from flagged_rowids would otherwise be
-        # dropped silently by the loop below -- a missed repair.
-        orphan_mojibake = set(col.mojibake_rowids) - set(valid_rowids)
-        if orphan_mojibake:
-            lines.append(
-                "-- WARNING: Column {0} had {1} mojibake ROWID(s) with no matching flagged ROWID "
-                "and were skipped; re-run the scan without a row_limit to cover them.".format(
-                    safe_name, len(orphan_mojibake)
-                )
-            )
-        quoted = quote_identifier(col.name)
-        # mojibake_rowids only ever holds rows up to 2000 characters -- longer
-        # values fail scan.MOJIBAKE_PREDICATE_TEMPLATE's LENGTH(col) <= 2000
-        # gate (UTL_I18N.STRING_TO_RAW's RAW limit) and so land in valid_rowids
-        # only, taking the lossy CONVERT branch below. See the file header note.
-        mojibake_rowid_set = set(col.mojibake_rowids)
-        # Byte-strip wins: an incomplete sequence is structural corruption and
-        # must be fixed before (or instead of) a lossy CONVERT of the same row.
-        strip_rowids = {row.rowid for row in valid_truncated}
-        for rowid in valid_rowids:
-            if rowid in strip_rowids:
-                continue
-            if rowid in mojibake_rowid_set:
-                expr = MOJIBAKE_REPAIR_EXPR_TEMPLATE.format(quoted)
-            else:
-                expr = "CONVERT({0}, 'US7ASCII')".format(quoted)
-            rowid_to_assignments.setdefault(rowid, []).append((quoted, expr))
-        for row in valid_truncated:
-            if row.valid_prefix_bytes <= 0:
-                expr = "NULL"
-            else:
-                expr = TRUNCATED_STRIP_EXPR_TEMPLATE.format(quoted, row.valid_prefix_bytes)
-            rowid_to_assignments.setdefault(row.rowid, []).append((quoted, expr))
-    lines.append("")
-    for rowid in sorted(rowid_to_assignments):
-        assignments = rowid_to_assignments[rowid]
-        set_clause = ", ".join("{0} = {1}".format(quoted, expr) for quoted, expr in assignments)
-        lines.append("UPDATE {0} SET {1} WHERE ROWID = CHARTOROWID('{2}');".format(target, set_clause, rowid))
     return lines
 
 
@@ -385,8 +294,14 @@ def render_fix_sql(obj_result: ObjectScanResult, fix_grouping: str = "row") -> O
         ]
     )
     if fix_grouping == "row":
-        lines.extend(_render_by_row(flagged, target))
+        for col in flagged:
+            lines.append("-- Column {0}: {1} flagged row(s) at scan time".format(
+                _escape_for_comment(col.name), max(col.multibyte_count or 0, col.truncated_count or 0)))
+        lines.extend(render_guarded_rows(obj_result, flagged))
     else:
+        lines.append("-- WARNING: column mode is not protected against changes since the scan.")
+        if any(col.data_type in {"NCHAR", "NVARCHAR2"} for col in flagged):
+            lines.append("-- WARNING: legacy national-character conversion can corrupt data; do not run these national-column statements.")
         lines.extend(_render_by_column(flagged, target))
     return "\n".join(lines).rstrip() + "\n"
 
@@ -408,7 +323,6 @@ def write_fix_sql(
         obj_result.object.name,
         timestamp or datetime.now(timezone.utc),
     )
-    secure_mkdir(path.parent)
-    path.write_text(sql, encoding="utf-8")
-    secure_chmod_file(path)
+    with open_private_text(path) as handle:
+        handle.write(sql)
     return path

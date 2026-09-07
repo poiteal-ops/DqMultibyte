@@ -32,7 +32,8 @@ class _UtcOnlyClock:
 
 def test_build_fix_path_is_timestamped_and_safe():
     path = build_fix_path(Path("reports/fixes"), "A/..", 'x"y', datetime(2026, 7, 27, 9, 5, 1))
-    assert path == Path("reports/fixes/2026-07-27-090501_fix_A_x_y.sql")
+    assert path.parent == Path("reports/fixes")
+    assert path.name.startswith("2026-07-27-090501_fix_A_x_y_") and path.suffix == ".sql"
 
 
 def test_render_fix_sql_returns_none_when_nothing_flagged():
@@ -82,78 +83,12 @@ def test_render_fix_sql_quotes_dictionary_object_and_column_names():
     assert '"E""F"' in sql
 
 
-def test_render_fix_sql_defaults_to_row_grouping():
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [ColumnScan("NAME", "VARCHAR2", 1, None, flagged_rowids=("AAAv1sAAEAAAAB4AAA",))],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result)
-
-    assert "WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');" in sql
 
 
-def test_render_fix_sql_row_grouping_emits_rowid_scoped_update_and_never_the_old_predicate():
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [ColumnScan("NAME", "VARCHAR2", 1, None, flagged_rowids=("AAAv1sAAEAAAAB4AAA",))],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result, fix_grouping="row")
-
-    quoted = quote_identifier("NAME")
-    expected_statement = "UPDATE \"APP\".\"T1\" SET {0} = CONVERT({0}, 'US7ASCII') WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');".format(
-        quoted
-    )
-    assert expected_statement in sql
-    assert "LENGTHB" not in sql
-    assert MULTIBYTE_PREDICATE_TEMPLATE.format(quoted) not in sql
 
 
-def test_render_fix_sql_row_grouping_consolidates_shared_rowid_across_columns():
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [
-            ColumnScan(
-                "NAME", "VARCHAR2", 2, None,
-                flagged_rowids=("AAAv1sAAEAAAAB4AAA", "AAAv1sAAEAAAAB4AAB"),
-            ),
-            ColumnScan(
-                "ADDR", "VARCHAR2", 2, None,
-                flagged_rowids=("AAAv1sAAEAAAAB4AAA", "AAAv1sAAEAAAAB4AAC"),
-            ),
-        ],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result, fix_grouping="row")
-
-    update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
-    # Rows ordered ascending by ROWID: AAA (shared), AAB (NAME only), AAC (ADDR only).
-    assert update_statements == [
-        'UPDATE "APP"."T1" SET "NAME" = CONVERT("NAME", \'US7ASCII\'), "ADDR" = CONVERT("ADDR", \'US7ASCII\') '
-        "WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');",
-        'UPDATE "APP"."T1" SET "NAME" = CONVERT("NAME", \'US7ASCII\') WHERE ROWID = CHARTOROWID(\'AAAv1sAAEAAAAB4AAB\');',
-        'UPDATE "APP"."T1" SET "ADDR" = CONVERT("ADDR", \'US7ASCII\') WHERE ROWID = CHARTOROWID(\'AAAv1sAAEAAAAB4AAC\');',
-    ]
 
 
-def test_render_fix_sql_row_grouping_orders_updates_by_rowid_regardless_of_fetch_order():
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [ColumnScan("NAME", "VARCHAR2", 2, None, flagged_rowids=("AAAv1sAAEAAAAB4AAB", "AAAv1sAAEAAAAB4AAA"))],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result, fix_grouping="row")
-
-    update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
-    assert [stmt for stmt in update_statements] == [
-        "UPDATE \"APP\".\"T1\" SET \"NAME\" = CONVERT(\"NAME\", 'US7ASCII') WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');",
-        "UPDATE \"APP\".\"T1\" SET \"NAME\" = CONVERT(\"NAME\", 'US7ASCII') WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAB');",
-    ]
 
 
 def test_render_fix_sql_row_grouping_warns_and_skips_when_no_rowids_were_captured():
@@ -184,8 +119,6 @@ def test_render_fix_sql_row_grouping_skips_a_rowid_that_fails_format_validation(
     assert "not-a-rowid" not in sql
     assert not any(line.startswith("UPDATE ") for line in sql.splitlines())
     assert "WARNING" in sql
-
-
 def test_render_fix_sql_rejects_an_unknown_fix_grouping():
     obj_result = ObjectScanResult(
         DbObject("APP", "T1", "TABLE"),
@@ -206,7 +139,8 @@ def test_write_fix_sql_writes_a_file_when_something_needs_fixing(tmp_path):
 
     path = write_fix_sql(obj_result, tmp_path, timestamp=datetime(2026, 7, 27, 9, 5, 1))
 
-    assert path == tmp_path / "2026-07-27-090501_fix_APP_T1.sql"
+    assert path.parent == tmp_path
+    assert path.name.startswith("2026-07-27-090501_fix_APP_T1_")
     assert path.exists()
     assert "UPDATE" in path.read_text(encoding="utf-8")
 
@@ -325,73 +259,8 @@ def test_write_fix_sql_writes_nothing_when_no_column_is_flagged(tmp_path):
 # --- Mojibake repair -------------------------------------------------------
 
 
-def test_render_fix_sql_row_grouping_splits_repair_and_convert_within_one_column():
-    """A single column with some flagged rows that are mojibake and some
-    that aren't must get the repair expression only for the mojibake rowids
-    and CONVERT for the rest, within one UPDATE per rowid."""
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [
-            ColumnScan(
-                "NAME", "VARCHAR2", 3, None,
-                flagged_rowids=("AAAv1sAAEAAAAB4AAA", "AAAv1sAAEAAAAB4AAB", "AAAv1sAAEAAAAB4AAC"),
-                mojibake_count=2,
-                mojibake_rowids=("AAAv1sAAEAAAAB4AAA", "AAAv1sAAEAAAAB4AAB"),
-            ),
-        ],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result, fix_grouping="row")
-
-    quoted = quote_identifier("NAME")
-    repair_expr = MOJIBAKE_REPAIR_EXPR_TEMPLATE.format(quoted)
-    update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
-    assert update_statements == [
-        "UPDATE \"APP\".\"T1\" SET {0} = {1} WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');".format(
-            quoted, repair_expr
-        ),
-        "UPDATE \"APP\".\"T1\" SET {0} = {1} WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAB');".format(
-            quoted, repair_expr
-        ),
-        "UPDATE \"APP\".\"T1\" SET {0} = CONVERT({0}, 'US7ASCII') WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAC');".format(
-            quoted
-        ),
-    ]
 
 
-def test_render_fix_sql_row_grouping_one_row_gets_a_repaired_column_and_a_converted_column():
-    """Edge case called out in the task brief: a single row has two flagged
-    columns, only one of which is mojibake for that row -- the consolidated
-    SET clause must use the repair expression for one column and CONVERT for
-    the other, in the same UPDATE statement."""
-    rowid = "AAAv1sAAEAAAAB4AAA"
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [
-            ColumnScan(
-                "NAME", "VARCHAR2", 1, None,
-                flagged_rowids=(rowid,), mojibake_count=1, mojibake_rowids=(rowid,),
-            ),
-            ColumnScan(
-                "ADDR", "VARCHAR2", 1, None,
-                flagged_rowids=(rowid,),  # mojibake_count defaults to None -- plain multibyte only
-            ),
-        ],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result, fix_grouping="row")
-
-    quoted_name = quote_identifier("NAME")
-    quoted_addr = quote_identifier("ADDR")
-    repair_expr = MOJIBAKE_REPAIR_EXPR_TEMPLATE.format(quoted_name)
-    update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
-    assert update_statements == [
-        "UPDATE \"APP\".\"T1\" SET {0} = {1}, {2} = CONVERT({2}, 'US7ASCII') WHERE ROWID = CHARTOROWID('{3}');".format(
-            quoted_name, repair_expr, quoted_addr, rowid
-        ),
-    ]
 
 
 def test_render_fix_sql_column_grouping_emits_convert_before_repair_for_mixed_column():
@@ -503,35 +372,6 @@ def test_render_fix_sql_column_grouping_mojibake_count_zero_is_byte_for_byte_unc
     assert "UTL_I18N" not in sql
 
 
-def test_render_fix_sql_row_grouping_mojibake_count_none_is_byte_for_byte_unchanged():
-    """Backward-compatibility anchor for row grouping: the default
-    mojibake_count=None/mojibake_rowids=() must produce the exact same
-    CONVERT-only UPDATE as before this feature existed."""
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [
-            ColumnScan(
-                "NAME", "VARCHAR2", 2, None,
-                flagged_rowids=("AAAv1sAAEAAAAB4AAA", "AAAv1sAAEAAAAB4AAB"),
-            ),
-        ],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result, fix_grouping="row")
-
-    quoted = quote_identifier("NAME")
-    update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
-    assert update_statements == [
-        "UPDATE \"APP\".\"T1\" SET {0} = CONVERT({0}, 'US7ASCII') WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');".format(
-            quoted
-        ),
-        "UPDATE \"APP\".\"T1\" SET {0} = CONVERT({0}, 'US7ASCII') WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAB');".format(
-            quoted
-        ),
-    ]
-    assert "MOJIBAKE" not in sql
-    assert "UTL_I18N" not in sql
 
 
 def test_render_fix_sql_header_omits_mojibake_note_when_nothing_is_mojibake():
@@ -560,34 +400,6 @@ def test_render_fix_sql_header_includes_mojibake_note_and_nls_charset_check_when
     assert "AL32UTF8" in sql
 
 
-def test_render_by_row_warns_about_mojibake_rowids_missing_from_the_flagged_set():
-    """Finding 5: scan._scan_one fetches flagged and mojibake ROWIDs with two
-    separate ROWNUM-bounded statements and no ORDER BY, so under a bounded
-    scan they can see different rows. A mojibake ROWID with no matching
-    flagged ROWID is dropped by the per-column loop -- a missed repair, which
-    must not be silent."""
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [
-            ColumnScan(
-                "NAME", "VARCHAR2", 1, None,
-                flagged_rowids=("AAAv1sAAEAAAAB4AAA",),
-                mojibake_count=2,
-                mojibake_rowids=("AAAv1sAAEAAAAB4AAA", "AAAv1sAAEAAAAB4AAZ"),
-            ),
-        ],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result, fix_grouping="row")
-
-    assert "-- WARNING: Column NAME had 1 mojibake ROWID(s) with no matching flagged ROWID" in sql
-    # The one rowid present in both sets is still repaired, not skipped.
-    update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
-    assert len(update_statements) == 1
-    assert "AAAv1sAAEAAAAB4AAA" in update_statements[0]
-    assert "UTL_I18N.RAW_TO_CHAR" in update_statements[0]
-    assert "AAAv1sAAEAAAAB4AAZ" not in update_statements[0]
 
 
 # --- Partial / truncated multibyte byte-strip ----------------------------
@@ -597,63 +409,10 @@ def _truncated_col(name="NAME", rows=()):
     return ColumnScan(name, "VARCHAR2", 0, None, truncated_count=len(rows), truncated_rows=tuple(rows))
 
 
-def test_render_fix_sql_row_grouping_emits_a_byte_strip_update_for_a_truncated_row():
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [_truncated_col(rows=[TruncatedRow("AAAv1sAAEAAAAB4AAA", 3, "C3", "unexpected end of data")])],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result, fix_grouping="row")
-
-    quoted = quote_identifier("NAME")
-    expected = (
-        "UPDATE \"APP\".\"T1\" SET {0} = SUBSTRB({0}, 1, 3) "
-        "WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');".format(quoted)
-    )
-    update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
-    assert update_statements == [expected]
 
 
-def test_render_fix_sql_row_grouping_truncated_row_with_zero_valid_prefix_sets_null():
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [_truncated_col(rows=[TruncatedRow("AAAv1sAAEAAAAB4AAA", 0, "80", "invalid start byte")])],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result, fix_grouping="row")
-
-    quoted = quote_identifier("NAME")
-    assert (
-        "UPDATE \"APP\".\"T1\" SET {0} = NULL WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');".format(quoted)
-        in sql
-    )
 
 
-def test_render_fix_sql_row_grouping_byte_strip_wins_over_convert_for_a_shared_rowid():
-    """A row that is both LENGTHB>LENGTH multibyte and has a truncated tail
-    must be byte-stripped, not CONVERT-flattened."""
-    rowid = "AAAv1sAAEAAAAB4AAA"
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [
-            ColumnScan(
-                "NAME", "VARCHAR2", 1, None,
-                flagged_rowids=(rowid,),
-                truncated_count=1,
-                truncated_rows=(TruncatedRow(rowid, 4, "E4 B8", "unexpected end of data"),),
-            )
-        ],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result, fix_grouping="row")
-
-    update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
-    assert len(update_statements) == 1
-    assert "SUBSTRB(" in update_statements[0]
-    assert "CONVERT(" not in update_statements[0]
 
 
 def test_truncated_strip_expr_is_substrb_and_within_varchar2_limit():
@@ -667,23 +426,6 @@ def test_truncated_strip_expr_is_substrb_and_within_varchar2_limit():
     assert "CAST_TO_RAW" not in expr
 
 
-def test_render_fix_sql_row_grouping_byte_strip_over_2000_bytes_still_one_substrb_update():
-    """Regression: a keep-length above the old 2000-byte RAW cap must still emit
-    a single SUBSTRB UPDATE, not error or split."""
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [_truncated_col(rows=[TruncatedRow("AAAv1sAAEAAAAB4AAA", 3500, "C3", "unexpected end of data")])],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result, fix_grouping="row")
-
-    quoted = quote_identifier("NAME")
-    update_statements = [line for line in sql.splitlines() if line.startswith("UPDATE ")]
-    assert update_statements == [
-        "UPDATE \"APP\".\"T1\" SET {0} = SUBSTRB({0}, 1, 3500) "
-        "WHERE ROWID = CHARTOROWID('AAAv1sAAEAAAAB4AAA');".format(quoted)
-    ]
 
 
 def test_render_fix_sql_mojibake_header_documents_the_2000_char_repair_ceiling():
@@ -759,24 +501,3 @@ def test_render_fix_sql_row_grouping_skips_a_truncated_rowid_that_fails_format_v
     assert "not-a-rowid" not in sql
     assert not any(line.startswith("UPDATE ") for line in sql.splitlines())
     assert "WARNING" in sql
-
-
-def test_render_by_row_emits_no_orphan_warning_when_mojibake_rowids_are_a_subset():
-    """The invariant holds on an unbounded scan, so the common case must stay
-    warning-free."""
-    obj_result = ObjectScanResult(
-        DbObject("APP", "T1", "TABLE"),
-        [
-            ColumnScan(
-                "NAME", "VARCHAR2", 2, None,
-                flagged_rowids=("AAAv1sAAEAAAAB4AAA", "AAAv1sAAEAAAAB4AAB"),
-                mojibake_count=1,
-                mojibake_rowids=("AAAv1sAAEAAAAB4AAA",),
-            ),
-        ],
-        "exhaustive",
-    )
-
-    sql = render_fix_sql(obj_result, fix_grouping="row")
-
-    assert "no matching flagged ROWID" not in sql

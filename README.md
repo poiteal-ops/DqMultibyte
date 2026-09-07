@@ -22,8 +22,12 @@ For running the test suite too:
 
 ```bash
 pip install -e ".[dev]"
-pytest
+pytest --basetemp=test-artifacts/pytest
 ```
+
+Keep temporary test output under the git-ignored `test-artifacts/` directory.
+Do not use `docs/` for pytest `--basetemp` paths; that directory is reserved for
+human-readable project documentation.
 
 ## Configuration
 
@@ -51,7 +55,7 @@ it.
 | `output_dir` | Where scan reports are written | `output/reports` |
 | `fixes_dir` | Where fix `.sql` scripts are written | `<output_dir>/fixes` |
 | `generate_fixes` | Write a fix `.sql` script for tables with flagged columns | `true` |
-| `fix_grouping` | `"row"`: one `UPDATE` per ROWID captured at scan time, consolidating all of that row's flagged columns into one `SET` clause. `"column"`: one `UPDATE` per flagged column, scoped by re-running the multibyte predicate at fix time (its `WHERE` clause is not scoped to the rows the scan actually looked at, e.g. under a bounded `row_limit` scan it can touch rows outside the sampled subset) | `"row"` |
+| `fix_grouping` | `"row"`: guarded, consolidated updates requiring unchanged original-byte evidence after a row lock. Unsupported or unverifiable rows receive no executable repair. `"column"`: legacy predicate updates at execution time, without scan-time stale-data protection; can touch rows outside a bounded scan | `"row"` |
 | `sample_row_limit` | Max flagged rows fetched per column to search for multibyte characters | `200` |
 | `sample_char_limit` | Max distinct multibyte characters shown per column | `20` |
 | `detect_mojibake` | Also scan for mojibake (SAS DI-style UTF-8-misread-as-Windows-1252 corruption) and report a repaired preview alongside each garbled sample. **Unlike every other check, this writes real column data into the report** -- see "Note on report contents" below | `false` |
@@ -87,12 +91,13 @@ Because catching this corruption is what the tool exists for, **`detect_truncate
 count, mojibake detection, non-ASCII counts, and character sampling are all
 skipped, and those columns show `-` in the report.
 
-In `--fix-grouping row` mode the generated fix script adds a per-ROWID
+In `--fix-grouping row` mode, eligible rows with complete guard evidence get a per-ROWID
 byte-strip `UPDATE` (`SET col = SUBSTRB(col, 1, <n>)`), which is **lossy** --
 the half character and anything after it in that value is discarded (a value
 broken at its first byte becomes `NULL`). `SUBSTRB` returns `VARCHAR2`, so it
 works up to 4000 bytes; a keep-length beyond that (`MAX_STRING_SIZE=EXTENDED`)
-is out of scope. `--fix-grouping column` can't express a
+is out of scope. Guarded repairs initially require the entire original value to
+fit within 4000 bytes, even when the keep-length is smaller. `--fix-grouping column` can't express a
 per-row keep-length, so it emits a comment block listing the ROWIDs and no
 `UPDATE`. Exhaustive runs fetch raw bytes for every non-ASCII row of each
 scanned column; use `--row-limit` for a first pass on a large table.
@@ -122,6 +127,12 @@ Copy `config/scan_targets.example.json` to `config/scan_targets.json`
   `--interactive` is a configuration error.
 - Table and column names are matched against Oracle's data dictionary before
   any SQL is built -- the manifest strings are never interpolated directly.
+- Column spelling is preserved. Exact matches take priority; a case-insensitive
+  fallback must be unique. For coexisting `Email` and `EMAIL`, `email` is
+  ambiguous and rejected. Both exact names can be explicitly selected.
+
+Boolean configuration values must be TOML `true` or `false`, without quotes.
+Strings such as `"false"` and numeric substitutes are rejected.
 
 ## CLI usage
 
@@ -177,12 +188,15 @@ mbscan --json-entry --json-entry-file config/prod_targets.json
 ```
 
 Each run writes:
-- a scan report to `output/reports/<timestamp>_report_<owner>_<object>.txt`
+- a scan report to `output/reports/<timestamp>_report_<owner>_<object>_<identity>_<run>.txt`
 - an operational log appended to `output/logs/mbscan-<YYYY-MM-DD>.log`
 - for each scanned table with at least one flagged column, a fix script to
-  `output/reports/fixes/<timestamp>_fix_<owner>_<table>.sql`
+  `output/reports/fixes/<timestamp>_fix_<owner>_<table>_<identity>_<run>.sql`
 
 Timestamps lead the filename so directory listings sort chronologically.
+Readable owner/object components are capped at 48 characters. An exact-identity
+digest and a fresh random identifier distinguish normalized names and repeated
+runs; exclusive creation rejects any remaining collision instead of overwriting.
 For a single-object run, `<object>` is the resolved object name. Batch runs
 use `multiple_objects` for an explicit multi-object list. Schema-wide mode
 uses `all_objects` when more than one eligible object is found; with one
@@ -203,8 +217,8 @@ warning to the console at the start of the run, and the report file itself
 opens with the same warning as its first line, so anyone who only sees the
 report (not this README) still gets it.
 
-**The fix script is generated, never executed.** Every statement is a
-set-based `UPDATE ... WHERE ...`, meant to be reviewed and run by someone
+**The fix script is generated, never executed by mbscan.** Row-mode updates are
+wrapped in PL/SQL with locking and revalidation, meant to be reviewed and run by someone
 with write access to the scanned tables, after taking a backup. Which repair
 expression a row or column gets depends on how the scan flagged it. Three
 are emitted:
@@ -249,6 +263,73 @@ When one row is flagged more than one way, the byte-strip wins -- an
 incomplete byte sequence is structural corruption that must be resolved
 before any other repair can even read the value.
 
+### Guarded row repairs and transactions
+
+Normal scanning is read-only: it needs no CREATE TABLE privilege or tablespace
+quota. Those permissions are used only by the opt-in disposable integration
+tests in [tests/integration](tests/integration/README.md).
+
+Each proposed repair captures its decision, conservative `ORA_ROWSCN`, byte
+length, and SHA-256 hashes of every 900-byte DUMP window in one SELECT. At repair
+time, the script locks the row with NOWAIT, checks target metadata, performs a
+separate fresh SELECT, and updates only if all proposed cells still match.
+It supports tables without primary keys. ROWID and ORA_ROWSCN are not a globally
+unique identity or an exact last-change timestamp.
+
+Use SQL*Plus/SQLcl **script mode in a dedicated READ COMMITTED session** with
+autocommit off, and keep the wrapper intact. Back up the affected data first.
+The script does not commit: successful rows remain locked until you manually
+choose COMMIT or ROLLBACK. Unexpected SQL/OS failures stop the script and roll
+back the transaction. Changed/unverifiable, missing, and busy rows are counted
+and skipped; one failed cell skips every assignment for that row.
+
+The report counts scan-time findings and omissions. Only the executed script
+can report UPDATED/SKIPPED outcomes. Finish the transaction before rescanning
+skipped rows. Block-level markers, delayed cleanout, or earlier repairs in the
+same transaction may cause conservative false skips, including on unchanged
+rows. Do not reuse scripts after restores, refreshes, flashback or migrations.
+Database/container name checks catch ordinary wrong targets, but cloned
+databases can share those names; verify the actual connection endpoint too.
+
+Current executable scope is ordinary, nonpartitioned heap tables, AL32UTF8,
+CHAR/VARCHAR2 source values of 1–4000 bytes, with or without ROWDEPENDENCIES.
+Views, materialized views, IOTs, external/temporary/clustered/partitioned tables,
+virtual columns, enabled table triggers, VPD policies, and unavailable metadata
+are excluded. Tables with a real `ORA_ROWSCN` column are excluded because it
+shadows Oracle's change marker. NCHAR/NVARCHAR2 remain scannable but receive no guarded row repair:
+live tests exposed datatype corruption in the existing national conversion.
+If such a column is proposed for a row, that whole row is omitted.
+
+The implementation has been exercised against Oracle 23.26.2.0.0 and its
+SQL*Plus client. Other versions and SQLcl require their own compatibility run.
+The heap-block recycling fixture observed ROWID reuse and rejected the old
+marker with and without ROWDEPENDENCIES. This is compatibility evidence for the
+tested version/storage, not a permanent identity guarantee. See the integration
+README for the exact proof limits.
+
+Column mode retains its legacy execution-time predicates and is **not protected
+against changes since the scan**. It can touch rows outside the scanned subset.
+Its national-character conversion can corrupt NCHAR/NVARCHAR2 data; do not run
+those statements. It is not a safe fallback for an omitted guarded repair.
+
+Fingerprints are sensitive derived data and can permit guessing attacks against
+low-entropy values. They do not make SQL artifacts safe to publish. No full
+original values or complete DUMP output are persisted for guards.
+
+### Output access and file safety
+
+Use an output root owned and controlled by the scanner operator. Report and SQL
+files are created exclusively; linked/reparse directory components are rejected,
+and incremental reports retain their original file handle. POSIX files start at
+0600 and new directories at 0700. Existing directory modes are preserved; shared
+writable paths and unsafe existing daily log files are rejected. On Windows,
+confidentiality depends on NTFS/share ACLs: the program does not configure them.
+
+Daily logs append only after handle/type/link checks. Windows denies concurrent
+writers to the same daily log while it is open; close the other scanner process
+before retrying. Filesystem safety assumes other users cannot modify the trusted
+output root or exercise administrator privileges.
+
 ## Logging
 
 Every run appends to a daily log file at
@@ -264,9 +345,10 @@ setting only -- there is no CLI flag -- and its values are `"prod"`
 **`prod` (default)** -- log level `INFO`. Oracle failures are recorded as a
 bare `ORA-NNNNN` code only, never Oracle's own message text, which can embed
 host, port, service name, schema, and SQL fragments. Console error output is
-a generic line. One exception: a configuration-error traceback is still
-written to the *log file* (never the console), so a bad config value can
-reach the log even here -- keep the log directory access-controlled.
+a generic line. Configuration failures also use a stable category in both the
+console and log, including failures before logging starts. Raw values and
+tracebacks are emitted only in explicit development mode. The application logger
+does not propagate initialized records to a host application's root handlers.
 
 **`dev`** -- a local-troubleshooting opt-in. Log level is raised to `DEBUG`.
 On failure the console prints the real error detail instead of the generic

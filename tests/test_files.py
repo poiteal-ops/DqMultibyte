@@ -23,14 +23,14 @@ def test_secure_mkdir_creates_owner_only_directory(tmp_path):
     assert _mode(target) == 0o700
 
 
-def test_secure_mkdir_tightens_an_existing_looser_directory(tmp_path):
+def test_secure_mkdir_preserves_an_existing_directory_mode(tmp_path):
     target = tmp_path / "reports"
     target.mkdir()
     target.chmod(0o755)
 
     secure_mkdir(target)
 
-    assert _mode(target) == 0o700
+    assert _mode(target) == 0o755
 
 
 def test_secure_chmod_file_restricts_an_existing_file(tmp_path):

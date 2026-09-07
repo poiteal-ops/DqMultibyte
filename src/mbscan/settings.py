@@ -28,6 +28,12 @@ def _validate_debug_level(value: Any) -> str:
     return value
 
 
+def _validate_bool(value: Any, key_name: str) -> bool:
+    if not isinstance(value, bool):
+        raise ConfigError("{0} must be a boolean, got {1!r}".format(key_name, value))
+    return value
+
+
 def _validate_positive_int(value: Any, key_name: str) -> int:
     """Validate that ``value`` is a positive integer, raising ``ConfigError`` if not.
 
@@ -68,10 +74,10 @@ def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
     owner = args.owner if args.owner is not None else config.get("owner")
     object_value = args.object_name if args.object_name is not None else config.get("object")
     object_names = parse_object_names(object_value)
-    config_all_objects = config.get("all_objects", False)
-    if not isinstance(config_all_objects, bool):
-        raise ConfigError("all_objects must be a boolean, got {0!r}".format(config_all_objects))
-    all_objects = config_all_objects or args.all_objects is True
+    all_objects = _validate_bool(
+        args.all_objects if args.all_objects is not None else config.get("all_objects", False),
+        "all_objects",
+    )
     timeout_seconds = (
         args.timeout_seconds
         if args.timeout_seconds is not None
@@ -83,6 +89,7 @@ def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
         if args.include_source_tables is not None
         else config.get("include_source_tables", False)
     )
+    include_source_tables = _validate_bool(include_source_tables, "include_source_tables")
     row_limit = args.row_limit if args.row_limit is not None else config.get("row_limit")
     row_limit = _validate_optional_positive_int(row_limit, "row_limit")
     include_non_ascii = (
@@ -90,6 +97,7 @@ def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
         if args.include_non_ascii is not None
         else config.get("include_non_ascii", False)
     )
+    include_non_ascii = _validate_bool(include_non_ascii, "include_non_ascii")
     sample_row_limit = (
         args.sample_row_limit if args.sample_row_limit is not None else config.get("sample_row_limit", 200)
     )
@@ -101,6 +109,7 @@ def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
     detect_mojibake = (
         args.detect_mojibake if args.detect_mojibake is not None else config.get("detect_mojibake", False)
     )
+    detect_mojibake = _validate_bool(detect_mojibake, "detect_mojibake")
     mojibake_sample_limit = (
         args.mojibake_sample_limit
         if args.mojibake_sample_limit is not None
@@ -112,17 +121,18 @@ def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
         if args.detect_truncated is not None
         else config.get("detect_truncated", False)
     )
+    detect_truncated = _validate_bool(detect_truncated, "detect_truncated")
     output_dir = Path(args.output_dir) if args.output_dir is not None else Path(config.get("output_dir", REPORTS_DIR))
     fixes_dir_value = args.fixes_dir if args.fixes_dir is not None else config.get("fixes_dir")
     fixes_dir = Path(fixes_dir_value) if fixes_dir_value is not None else None
     generate_fixes = (
         args.generate_fixes if args.generate_fixes is not None else config.get("generate_fixes", True)
     )
+    generate_fixes = _validate_bool(generate_fixes, "generate_fixes")
     fix_grouping = args.fix_grouping if args.fix_grouping is not None else config.get("fix_grouping", "row")
     fix_grouping = _validate_fix_grouping(fix_grouping)
     json_entry = args.json_entry if args.json_entry is not None else config.get("json_entry", False)
-    if not isinstance(json_entry, bool):
-        raise ConfigError("json_entry must be a boolean, got {0!r}".format(json_entry))
+    json_entry = _validate_bool(json_entry, "json_entry")
     json_entry_file_value = (
         args.json_entry_file if args.json_entry_file is not None else config.get("json_entry_file")
     )

@@ -51,13 +51,18 @@ def test_load_scan_manifest_treats_empty_columns_list_as_scan_all(tmp_path):
     assert load_scan_manifest(path).tables[0].columns == ()
 
 
-def test_load_scan_manifest_dedupes_columns_case_insensitively_keeping_order(tmp_path):
+def test_load_scan_manifest_dedupes_only_exact_column_spellings_keeping_order(tmp_path):
     path = _write(
         tmp_path,
-        {"owner": "DQ_TEST", "tables": [{"table": "T", "columns": ["A", "b", "a", "B"]}]},
+        {
+            "owner": "DQ_TEST",
+            "tables": [
+                {"table": "T", "columns": ["Email", "EMAIL", "Email", "email", "EMAIL"]}
+            ],
+        },
     )
 
-    assert load_scan_manifest(path).tables[0].columns == ("A", "b")
+    assert load_scan_manifest(path).tables[0].columns == ("Email", "EMAIL", "email")
 
 
 def test_load_scan_manifest_rejects_a_missing_file(tmp_path):

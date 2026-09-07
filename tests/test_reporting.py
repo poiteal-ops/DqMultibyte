@@ -22,7 +22,8 @@ from mbscan.scan import (
 
 def test_report_path_is_timestamped_and_safe():
     path = build_report_path(Path("reports"), "A/..", 'x"y', datetime(2026, 7, 27, 9, 5, 1))
-    assert path == Path("reports/2026-07-27-090501_report_A_x_y.txt")
+    assert path.parent == Path("reports")
+    assert path.name.startswith("2026-07-27-090501_report_A_x_y_") and path.suffix == ".txt"
 
 
 class _UtcOnlyClock:
@@ -287,8 +288,8 @@ def test_write_report_uses_batch_filename_labels(tmp_path):
         batch_label="all_objects",
     )
 
-    assert multiple_path.name.endswith("_report_HR_multiple_objects.txt")
-    assert all_path.name.endswith("_report_HR_all_objects.txt")
+    assert "_report_HR_multiple_objects_" in multiple_path.name and multiple_path.suffix == ".txt"
+    assert "_report_HR_all_objects_" in all_path.name and all_path.suffix == ".txt"
 
 
 def test_incremental_report_writer_matches_render_report_for_a_batch(tmp_path):
@@ -391,13 +392,15 @@ def test_a_crash_partway_through_a_batch_still_leaves_earlier_tables_on_disk(tmp
     assert "object: HR.DEPARTMENTS" not in text
 
 
-def test_start_report_builds_the_same_path_as_write_report(tmp_path):
+def test_start_report_allocates_a_unique_path_for_each_artifact(tmp_path):
     selected = (DbObject("HR", "EMPLOYEES", "TABLE"),)
     timestamp = datetime(2026, 8, 6, tzinfo=timezone.utc)
 
     writer = reporting.start_report(selected, tmp_path, timestamp)
 
-    assert writer.path == build_report_path(tmp_path, "HR", "EMPLOYEES", timestamp)
+    other_path = build_report_path(tmp_path, "HR", "EMPLOYEES", timestamp)
+    assert writer.path != other_path
+    assert writer.path.name.startswith("2026-08-06-000000_report_HR_EMPLOYEES_")
 
 
 def test_render_report_truncates_long_mojibake_sample_values():

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any, List
 
 from mbscan.oracle.connection import ConfigError
+from mbscan.repair_guards import DATABASE_HASH_SQL, RepairTargetEvidence, validate_target_evidence
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,48 @@ class DbObject:
     owner: str
     name: str
     object_type: str
+
+
+def repair_target_evidence(cursor: Any, obj: DbObject, columns: list[tuple[str, str]]) -> RepairTargetEvidence | None:
+    """Conservatively allow ordinary nonpartitioned heap tables only.
+
+    All dictionary filters bind values. Storage variants remain excluded until
+    the compatibility fixture has established their marker/locking behavior.
+    """
+    if obj.object_type != "TABLE" or not columns:
+        return None
+    cursor.execute(
+        "SELECT o.object_id, " + DATABASE_HASH_SQL + " FROM all_objects o "
+        "JOIN all_tables t ON t.owner=o.owner AND t.table_name=o.object_name "
+        "WHERE o.owner=:owner AND o.object_name=:name AND o.object_type='TABLE' "
+        "AND o.subobject_name IS NULL AND t.iot_type IS NULL AND t.cluster_name IS NULL "
+        "AND t.temporary='N' AND t.partitioned='NO' AND t.nested='NO' AND t.secondary='N' "
+        "AND NOT EXISTS (SELECT 1 FROM all_external_tables e WHERE e.owner=o.owner AND e.table_name=o.object_name) "
+        "AND NOT EXISTS (SELECT 1 FROM all_mviews m WHERE m.owner=o.owner AND m.mview_name=o.object_name) "
+        "AND NOT EXISTS (SELECT 1 FROM all_triggers g WHERE g.table_owner=o.owner AND g.table_name=o.object_name AND g.status='ENABLED') "
+        "AND NOT EXISTS (SELECT 1 FROM all_policies p WHERE p.object_owner=o.owner AND p.object_name=o.object_name AND p.enable='YES') "
+        "AND NOT EXISTS (SELECT 1 FROM all_tab_cols mc WHERE mc.owner=o.owner AND mc.table_name=o.object_name AND mc.column_name='ORA_ROWSCN') "
+        "AND EXISTS (SELECT 1 FROM nls_database_parameters WHERE parameter='NLS_CHARACTERSET' AND value='AL32UTF8')",
+        {"owner": obj.owner, "name": obj.name},
+    )
+    targets = cursor.fetchall()
+    if len(targets) != 1:
+        return None
+    cursor.execute(
+        "SELECT column_name, data_type, data_length FROM all_tab_cols "
+        "WHERE owner=:owner AND table_name=:name AND virtual_column='NO' AND hidden_column='NO' ORDER BY column_id",
+        {"owner": obj.owner, "name": obj.name},
+    )
+    wanted = dict(columns)
+    types = tuple((n, t, size) for n, t, size in cursor.fetchall() if n in wanted and wanted[n] == t)
+    if len(types) != len(columns):
+        return None
+    evidence = RepairTargetEvidence(targets[0][1], targets[0][0], types)
+    try:
+        validate_target_evidence(evidence)
+    except (ValueError, TypeError):
+        return None
+    return evidence
 
 
 def parse_object_names(value: str | None, key_name: str = "object") -> tuple[str, ...]:
