@@ -218,6 +218,23 @@ def test_resolve_settings_rejects_an_unknown_fix_grouping():
         settings.resolve_settings({"fix_grouping": "per_char"}, _args())
 
 
+def test_resolve_settings_defaults_debug_level_to_prod():
+    resolved = settings.resolve_settings({}, _args())
+
+    assert resolved.debug_level == "prod"
+
+
+def test_resolve_settings_uses_configured_debug_level():
+    resolved = settings.resolve_settings({"debug_level": "dev"}, _args())
+
+    assert resolved.debug_level == "dev"
+
+
+def test_resolve_settings_rejects_an_unknown_debug_level():
+    with pytest.raises(ConfigError, match="debug_level"):
+        settings.resolve_settings({"debug_level": "verbose"}, _args())
+
+
 def test_resolve_settings_defaults_detect_mojibake_to_false_and_sample_limit_to_ten():
     resolved = settings.resolve_settings({}, _args())
 

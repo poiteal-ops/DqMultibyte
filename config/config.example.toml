@@ -30,6 +30,12 @@ sample_char_limit = 20
 detect_mojibake = false
 mojibake_sample_limit = 10
 
+# "prod" (default) keeps console/log error output generic and code-only --
+# never a raw config value, Oracle message, or traceback. "dev" is an
+# explicit opt-in for local troubleshooting: it prints the real error
+# message and traceback to the console and raises the log level to DEBUG.
+# debug_level = "dev"
+
 # Detect rows whose stored bytes hold an incomplete multibyte character
 # (SAS-DI "character cut in half"; Oracle raises ORA-29275 reading them).
 # This is the tool's primary purpose, so when true it is the ONLY check that

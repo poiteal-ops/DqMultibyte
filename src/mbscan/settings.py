@@ -13,11 +13,18 @@ from mbscan.scan import ScanSettings
 
 DEFAULT_TIMEOUT_SECONDS = 30
 FIX_GROUPINGS = {"row", "column"}
+DEBUG_LEVELS = {"dev", "prod"}
 
 
 def _validate_fix_grouping(value: Any) -> str:
     if value not in FIX_GROUPINGS:
         raise ConfigError("fix_grouping must be one of {0}, got {1!r}".format(sorted(FIX_GROUPINGS), value))
+    return value
+
+
+def _validate_debug_level(value: Any) -> str:
+    if value not in DEBUG_LEVELS:
+        raise ConfigError("debug_level must be one of {0}, got {1!r}".format(sorted(DEBUG_LEVELS), value))
     return value
 
 
@@ -52,6 +59,7 @@ class ResolvedSettings:
     fix_grouping: str = "row"
     json_entry: bool = False
     json_entry_file: Path = DEFAULT_MANIFEST_PATH
+    debug_level: str = "prod"
 
 
 def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
@@ -121,6 +129,9 @@ def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
     json_entry_file = (
         Path(json_entry_file_value) if json_entry_file_value is not None else DEFAULT_MANIFEST_PATH
     )
+    # config/config.toml only -- not a CLI flag. dev unlocks verbose error/log
+    # detail (see cli.py); prod is the safe default and matches prior behavior.
+    debug_level = _validate_debug_level(config.get("debug_level", "prod"))
     return ResolvedSettings(
         owner=owner,
         object_names=object_names,
@@ -144,4 +155,5 @@ def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
         fix_grouping=fix_grouping,
         json_entry=json_entry,
         json_entry_file=json_entry_file,
+        debug_level=debug_level,
     )

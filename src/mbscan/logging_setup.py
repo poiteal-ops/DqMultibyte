@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from mbscan.files import LOG_DIR
+from mbscan.files import LOG_DIR, secure_chmod_file, secure_mkdir
 
 LOG_FILENAME_FORMAT = "mbscan-%Y-%m-%d.log"
 LOG_FORMAT = "%(asctime)s %(levelname)-5s [%(run_id)s] %(component)-24s %(message)s"
@@ -86,6 +86,7 @@ def configure_logging(
     object_name: str,
     log_dir: Optional[Path] = None,
     timestamp: Optional[datetime] = None,
+    level: int = logging.INFO,
 ) -> Path:
     """Attach a file handler for today's log and return its path.
 
@@ -93,6 +94,10 @@ def configure_logging(
     from a previous call in this process (e.g. a re-run in the same
     interpreter) are closed and removed first, so exactly one handler stays
     attached and each line is written exactly once.
+
+    ``level`` defaults to INFO (prod). Callers pass DEBUG for dev-mode runs
+    (config.toml ``debug_level = "dev"``) to admit any DEBUG-level detail;
+    it does not by itself change what individual log calls choose to record.
     """
     logger = logging.getLogger("mbscan")
     for old_handler in list(logger.handlers):
@@ -103,15 +108,16 @@ def configure_logging(
         log_dir = LOG_DIR
 
     moment = timestamp or datetime.now(timezone.utc)
-    log_dir.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(log_dir)
     path = log_dir / moment.strftime(LOG_FILENAME_FORMAT)
 
     handler = logging.FileHandler(path, mode="a", encoding="utf-8")
+    secure_chmod_file(path)
     formatter = _SafeLogFormatter(LOG_FORMAT)
     formatter.converter = time.gmtime
     handler.setFormatter(formatter)
     handler.addFilter(_RunContextFilter(uuid.uuid4().hex[:4]))
-    logger.setLevel(logging.INFO)
+    logger.setLevel(level)
     logger.addHandler(handler)
     logger.info("Run started")
     return path

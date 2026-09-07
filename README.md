@@ -52,7 +52,7 @@ it.
 | `fix_grouping` | `"row"`: one `UPDATE` per ROWID captured at scan time, consolidating all of that row's flagged columns into one `SET` clause. `"column"`: one `UPDATE` per flagged column, scoped by re-running the multibyte predicate at fix time (its `WHERE` clause is not scoped to the rows the scan actually looked at, e.g. under a bounded `row_limit` scan it can touch rows outside the sampled subset) | `"row"` |
 | `sample_row_limit` | Max flagged rows fetched per column to search for multibyte characters | `200` |
 | `sample_char_limit` | Max distinct multibyte characters shown per column | `20` |
-| `detect_mojibake` | Also scan for mojibake (SAS DI-style UTF-8-misread-as-Windows-1252 corruption) and report a repaired preview alongside each garbled sample | `false` |
+| `detect_mojibake` | Also scan for mojibake (SAS DI-style UTF-8-misread-as-Windows-1252 corruption) and report a repaired preview alongside each garbled sample. **Unlike every other check, this writes real column data into the report** -- see "Note on report contents" below | `false` |
 | `mojibake_sample_limit` | Max flagged rows fetched per column to search for mojibake values | `10` |
 | `detect_truncated` | Detect rows whose stored bytes hold an **incomplete** multibyte character -- the SAS DI "character cut in half" corruption Oracle reports as `ORA-29275: partial multibyte character`. This is the tool's primary purpose, so **when true it is the only check that runs** (multibyte counts, mojibake, and non-ASCII are skipped). `VARCHAR2`/`CHAR` only; self-skips unless the database character set is `AL32UTF8` or `UTF8` | `false` |
 | `json_entry` | Read the exact table+column targets from a JSON manifest instead of `owner`/`object`/`all_objects`. Mutually exclusive with all three and with `--interactive` | `false` |
@@ -194,7 +194,11 @@ while generated fix scripts remain separate per object/table.
 **Note on report contents:** the multibyte preview lists only the distinct
 characters found, never whole values. The mojibake preview (`detect_mojibake`)
 is the exception -- it shows real column data, each garbled/repaired value
-truncated to 120 characters. Treat those reports accordingly.
+truncated to 120 characters. Treat those reports accordingly. This isn't
+only documented here: with `detect_mojibake` on, `mbscan` also prints a
+warning to the console at the start of the run, and the report file itself
+opens with the same warning as its first line, so anyone who only sees the
+report (not this README) still gets it.
 
 **The fix script is generated, never executed.** It contains one
 set-based `UPDATE ... SET col = CONVERT(col, 'US7ASCII') WHERE ...` per

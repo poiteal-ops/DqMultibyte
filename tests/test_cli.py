@@ -53,7 +53,7 @@ def _stub_successful_run(monkeypatch, obj, connect_spy=None):
 
     monkeypatch.setattr(cli, "scan_objects", fake_scan_objects)
     monkeypatch.setattr(cli, "write_fix_sql", lambda obj_result, fixes_dir, **kwargs: None)
-    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name: Path("unused.log"))
+    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name, **kwargs: Path("unused.log"))
 
 
 def _with_config(monkeypatch, config):
@@ -175,7 +175,7 @@ def test_run_rejects_ambiguous_quoted_case_object_match(monkeypatch, capsys, tmp
             ConfigError("Object 'foo' is ambiguous")
         ),
     )
-    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name: Path("unused.log"))
+    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name, **kwargs: Path("unused.log"))
     _with_config(monkeypatch, {"owner": "SCOTT", "object": "foo"})
 
     exit_code = _run(["--output-dir", str(tmp_path)])
@@ -206,7 +206,7 @@ def test_run_resolves_exact_case_match_even_when_a_case_insensitive_duplicate_ex
     monkeypatch.setattr(cli, "resolve_requested_objects", lambda cursor, owner, names: (obj,))
     monkeypatch.setattr(cli, "scan_objects", fake_scan_objects)
     monkeypatch.setattr(cli, "write_fix_sql", lambda obj_result, fixes_dir, **kwargs: None)
-    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name: Path("unused.log"))
+    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name, **kwargs: Path("unused.log"))
     _with_config(monkeypatch, {"owner": "SCOTT", "object": "FOO"})
 
     exit_code = _run(["--output-dir", str(tmp_path)])
@@ -261,7 +261,7 @@ def test_run_does_not_log_raw_requested_object_input(monkeypatch, tmp_path, capl
     monkeypatch.setattr(
         cli,
         "configure_logging",
-        lambda owner, object_name: object_labels.append((owner, object_name)) or Path("unused.log"),
+        lambda owner, object_name, **kwargs: object_labels.append((owner, object_name)) or Path("unused.log"),
     )
     _with_config(monkeypatch, {"owner": "SCOTT", "object": requested})
 
@@ -347,6 +347,28 @@ def test_run_reports_a_bad_config_value_as_a_clean_configuration_error(monkeypat
     assert "timeout_seconds" not in captured.out
 
 
+def test_run_prints_the_real_config_error_in_dev_mode(monkeypatch, capsys, tmp_path):
+    """debug_level = "dev" is an explicit opt-in to the detail prod hides."""
+    _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1", "timeout_seconds": 0, "debug_level": "dev"})
+
+    exit_code = _run(["--output-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "timeout_seconds" in captured.out
+    assert "Traceback" in captured.out
+
+
+def test_run_rejects_an_unknown_debug_level(monkeypatch, capsys, tmp_path):
+    _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1", "debug_level": "verbose"})
+
+    exit_code = _run(["--output-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert "Configuration error: invalid or unavailable configuration." in captured.out
+
+
 def test_run_passes_a_callable_progress_factory_into_scan_objects(monkeypatch, tmp_path):
     obj = DbObject("SCOTT", "T1", "TABLE")
     captured = {}
@@ -384,7 +406,7 @@ def test_run_reports_oracle_errors_without_leaking_raw_details(monkeypatch, caps
 
     monkeypatch.setattr(cli, "load_config", lambda: SimpleNamespace(username="scott"))
     monkeypatch.setattr(cli, "connect", fail_to_connect)
-    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name: Path("unused.log"))
+    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name, **kwargs: Path("unused.log"))
     _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1"})
 
     exit_code = _run(["--output-dir", str(tmp_path)])
@@ -411,7 +433,7 @@ def test_run_reports_driver_level_errors_by_full_code_not_zero(monkeypatch, caps
 
     monkeypatch.setattr(cli, "load_config", lambda: SimpleNamespace(username="scott"))
     monkeypatch.setattr(cli, "connect", fail_to_connect)
-    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name: Path("unused.log"))
+    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name, **kwargs: Path("unused.log"))
     _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1"})
 
     exit_code = _run(["--output-dir", str(tmp_path)])
@@ -420,6 +442,27 @@ def test_run_reports_driver_level_errors_by_full_code_not_zero(monkeypatch, caps
     assert exit_code == 3
     assert "DPY-4011" in captured.out
     assert "Oracle error 0" not in captured.out
+
+
+def test_run_prints_the_real_oracle_error_in_dev_mode(monkeypatch, capsys, tmp_path):
+    def fail_to_connect(config, timeout_seconds):
+        raise oracledb.Error(
+            SimpleNamespace(
+                code=12541,
+                message="TNS:no listener (HOST=db.internal.example.com)(PORT=1521)",
+            )
+        )
+
+    monkeypatch.setattr(cli, "load_config", lambda: SimpleNamespace(username="scott"))
+    monkeypatch.setattr(cli, "connect", fail_to_connect)
+    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name, **kwargs: Path("unused.log"))
+    _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1", "debug_level": "dev"})
+
+    exit_code = _run(["--output-dir", str(tmp_path)])
+
+    captured = capsys.readouterr()
+    assert exit_code == 3
+    assert "db.internal.example.com" in captured.out
 
 
 def test_run_derives_fixes_dir_from_output_dir_when_not_given(monkeypatch, tmp_path):
@@ -568,6 +611,28 @@ def test_run_logs_resolved_mojibake_settings(monkeypatch, tmp_path, caplog):
     assert "mojibake_sample_limit=3" in resolved_log
 
 
+def test_run_warns_on_console_when_mojibake_detection_is_on(monkeypatch, capsys, tmp_path):
+    obj = DbObject("SCOTT", "T1", "TABLE")
+    _stub_successful_run(monkeypatch, obj)
+    _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1"})
+
+    exit_code = _run(["--detect-mojibake", "--output-dir", str(tmp_path)])
+
+    assert exit_code == 0
+    assert "real column data" in capsys.readouterr().out
+
+
+def test_run_omits_mojibake_console_warning_when_detection_is_off(monkeypatch, capsys, tmp_path):
+    obj = DbObject("SCOTT", "T1", "TABLE")
+    _stub_successful_run(monkeypatch, obj)
+    _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1"})
+
+    exit_code = _run(["--no-detect-mojibake", "--output-dir", str(tmp_path)])
+
+    assert exit_code == 0
+    assert "real column data" not in capsys.readouterr().out
+
+
 def test_detect_truncated_flag_defaults_to_none_and_supports_negation():
     assert _register().parse_args([]).detect_truncated is None
     assert _register().parse_args(["--detect-truncated"]).detect_truncated is True
@@ -641,7 +706,7 @@ def test_run_json_entry_scans_manifest_targets_with_a_column_filter(monkeypatch,
 )
 def test_run_json_entry_conflicts_with_other_selection_modes(monkeypatch, tmp_path, capsys, config, argv):
     monkeypatch.setattr(cli, "connect", lambda *a, **k: pytest.fail("must not connect"))
-    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name: Path("unused.log"))
+    monkeypatch.setattr(cli, "configure_logging", lambda owner, object_name, **kwargs: Path("unused.log"))
     _with_config(monkeypatch, config)
 
     exit_code = _run(argv + ["--output-dir", str(tmp_path)])

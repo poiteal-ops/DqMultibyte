@@ -1,3 +1,5 @@
+import os
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -207,6 +209,23 @@ def test_write_fix_sql_writes_a_file_when_something_needs_fixing(tmp_path):
     assert path == tmp_path / "2026-07-27-090501_fix_APP_T1.sql"
     assert path.exists()
     assert "UPDATE" in path.read_text(encoding="utf-8")
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="POSIX file permission bits only; Windows uses NTFS ACLs"
+)
+def test_write_fix_sql_restricts_output_to_the_owner(tmp_path):
+    obj_result = ObjectScanResult(
+        DbObject("APP", "T1", "TABLE"),
+        [ColumnScan("NAME", "VARCHAR2", 3, None, flagged_rowids=("AAAv1sAAEAAAAB4AAA",))],
+        "exhaustive",
+    )
+    fixes_dir = tmp_path / "fixes"
+
+    path = write_fix_sql(obj_result, fixes_dir, timestamp=datetime(2026, 7, 27, 9, 5, 1))
+
+    assert stat.S_IMODE(fixes_dir.stat().st_mode) == 0o700
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 def test_write_fix_sql_writes_a_file_in_column_grouping_mode(tmp_path):

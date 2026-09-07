@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import traceback
 from pathlib import Path
 from typing import List, Optional
 
@@ -78,6 +79,43 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _report_configuration_error(exc: Exception, debug_level: str, log_path: Optional[Path]) -> None:
+    """Print a ConfigError/ValueError to the console.
+
+    prod (default) stays the deliberately generic line -- ConfigError/ValueError
+    text can embed config-file paths and setting values, and the console must
+    never echo those back out. dev is an explicit opt-in for local
+    troubleshooting: it prints the real message and traceback. The full
+    detail always goes to the log file either way (see logging_setup.py).
+    """
+    logger.error("Configuration error", exc_info=True)
+    if debug_level == "dev":
+        print("Configuration error: {0}".format(exc))
+        print(traceback.format_exc())
+        if log_path is not None:
+            print("Log: {0}".format(log_path))
+    else:
+        print("Configuration error: invalid or unavailable configuration.")
+
+
+def _report_oracle_error(exc: oracledb.Error, debug_level: str, log_path: Optional[Path]) -> None:
+    """Print an Oracle error to the console.
+
+    prod (default) stays code-only -- Oracle's own message text can carry
+    connection strings, host names, and SQL fragments (see oracle/errors.py).
+    dev prints the full Oracle message for local troubleshooting.
+    """
+    code = oracle_error_code(exc)
+    if debug_level == "dev":
+        logger.error("Oracle error %s", exc, exc_info=True)
+        print("Oracle error {0}: {1}".format(code, exc))
+        if log_path is not None:
+            print("Log: {0}".format(log_path))
+    else:
+        logger.error("Oracle error %s", code)
+        print("Oracle error {0}".format(code))
+
+
 def _choose_object(cursor, owner: str) -> DbObject:
     objects = list_exportable_objects(cursor, owner)
     if not objects:
@@ -91,8 +129,19 @@ def _choose_object(cursor, owner: str) -> DbObject:
 
 
 def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
+    # Known before resolve_settings() so an error raised while resolving
+    # settings can still be reported at the right verbosity. Best-effort: an
+    # invalid value here just falls back to prod-safe reporting -- the real
+    # validation (and ConfigError, if it's bad) happens inside resolve_settings.
+    debug_level = "prod"
+    log_path: Optional[Path] = None
     try:
-        resolved = resolve_settings(load_toml_config(), args)
+        toml_config = load_toml_config()
+        if toml_config.get("debug_level") == "dev":
+            debug_level = "dev"
+
+        resolved = resolve_settings(toml_config, args)
+        debug_level = resolved.debug_level
         if args.interactive and resolved.all_objects:
             raise ConfigError("--interactive cannot be combined with --all-objects")
         if resolved.json_entry:
@@ -114,17 +163,27 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         ):
             parser.error("--owner and --object are required (directly, via --interactive, or via config/config.toml)")
 
-        log_path = configure_logging("mbscan", "run")
+        log_path = configure_logging(
+            "mbscan", "run",
+            level=logging.DEBUG if debug_level == "dev" else logging.INFO,
+        )
+        if resolved.scan.detect_mojibake:
+            print(
+                "Note: --detect-mojibake is enabled. Unlike every other check, the "
+                "generated report will contain real column data (not just character "
+                "counts) for any mojibake it finds -- handle the report like the "
+                "source data."
+            )
         logger.info(
             "Resolved settings: all_objects=%s requested_object_count=%s scope=%s row_limit=%s include_non_ascii=%s "
             "timeout_seconds=%s generate_fixes=%s fix_grouping=%s sample_row_limit=%s sample_char_limit=%s "
-            "detect_mojibake=%s mojibake_sample_limit=%s detect_truncated=%s json_entry=%s",
+            "detect_mojibake=%s mojibake_sample_limit=%s detect_truncated=%s json_entry=%s debug_level=%s",
             resolved.all_objects, len(resolved.object_names), resolved.scan.scope,
             resolved.scan.row_limit, resolved.scan.include_non_ascii, resolved.timeout_seconds,
             resolved.generate_fixes, resolved.fix_grouping,
             resolved.scan.sample_row_limit, resolved.scan.sample_char_limit,
             resolved.scan.detect_mojibake, resolved.scan.mojibake_sample_limit,
-            resolved.scan.detect_truncated, resolved.json_entry,
+            resolved.scan.detect_truncated, resolved.json_entry, resolved.debug_level,
         )
         config = load_config()
         with connect(config, resolved.timeout_seconds) as connection:
@@ -171,7 +230,10 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 fix_paths: List[Path] = []
 
                 def _on_batch_start(selected, dependencies, charset, truncated_skip_reason):
-                    report_writer.start(selected, resolved.scan.scope, dependencies, truncated_skip_reason)
+                    report_writer.start(
+                        selected, resolved.scan.scope, dependencies, truncated_skip_reason,
+                        resolved.scan.detect_mojibake,
+                    )
 
                 def _on_object_scanned(obj_result):
                     report_writer.append_object(obj_result)
@@ -198,15 +260,15 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         print("Log written: {0}".format(log_path))
         run_complete()
         return 0
-    except (ConfigError, ValueError):
-        # Full traceback goes to the log file only -- the console message
+    except (ConfigError, ValueError) as exc:
+        # prod: full traceback goes to the log file only -- the console message
         # stays generic so it never echoes a raw config value back out.
-        logger.error("Configuration error", exc_info=True)
-        print("Configuration error: invalid or unavailable configuration.")
+        # dev (config/config.toml debug_level = "dev"): the real message and
+        # traceback print to the console too. See _report_configuration_error.
+        _report_configuration_error(exc, debug_level, log_path)
         return 2
     except oracledb.Error as exc:
-        logger.error("Oracle error %s", oracle_error_code(exc))
-        print("Oracle error {0}".format(oracle_error_code(exc)))
+        _report_oracle_error(exc, debug_level, log_path)
         return 3
 
 

@@ -1,5 +1,9 @@
+import os
+import stat
 from datetime import datetime, timezone
 from pathlib import Path
+
+import pytest
 
 from mbscan.oracle.metadata import DbObject
 from mbscan import reporting
@@ -36,6 +40,27 @@ def _result(columns):
         dependencies=[],
         objects=[ObjectScanResult(selected, columns, "exhaustive")],
     )
+
+
+def test_render_report_warns_when_mojibake_detection_is_on():
+    selected = DbObject("APP", "T1", "TABLE")
+    result = ScanResult(
+        selected=selected,
+        settings=ScanSettings(detect_mojibake=True),
+        dependencies=[],
+        objects=[ObjectScanResult(selected, [], "exhaustive")],
+    )
+
+    text = render_report(result)
+
+    assert reporting.MOJIBAKE_REPORT_WARNING in text
+    assert text.splitlines()[0] == reporting.MOJIBAKE_REPORT_WARNING
+
+
+def test_render_report_omits_mojibake_warning_when_detection_is_off():
+    text = render_report(_result([]))
+
+    assert reporting.MOJIBAKE_REPORT_WARNING not in text
 
 
 def test_render_report_aligns_columns_with_differing_name_lengths():
@@ -302,6 +327,27 @@ def test_incremental_report_writer_creates_parent_directory(tmp_path):
     writer.start((DbObject("APP", "T1", "TABLE"),), "selected", (), None)
 
     assert writer.path.exists()
+
+
+def test_incremental_report_writer_warns_when_mojibake_detection_is_on(tmp_path):
+    writer = reporting.IncrementalReportWriter(tmp_path / "report.txt")
+
+    writer.start((DbObject("APP", "T1", "TABLE"),), "selected", (), None, detect_mojibake=True)
+
+    assert writer.path.read_text(encoding="utf-8").splitlines()[0] == reporting.MOJIBAKE_REPORT_WARNING
+
+
+@pytest.mark.skipif(
+    os.name != "posix", reason="POSIX file permission bits only; Windows uses NTFS ACLs"
+)
+def test_incremental_report_writer_restricts_output_to_the_owner(tmp_path):
+    nested = tmp_path / "reports" / "nested"
+    writer = reporting.IncrementalReportWriter(nested / "report.txt")
+
+    writer.start((DbObject("APP", "T1", "TABLE"),), "selected", (), None)
+
+    assert stat.S_IMODE(nested.stat().st_mode) == 0o700
+    assert stat.S_IMODE(writer.path.stat().st_mode) == 0o600
 
 
 def test_a_crash_partway_through_a_batch_still_leaves_earlier_tables_on_disk(tmp_path):
