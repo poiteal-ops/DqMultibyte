@@ -611,6 +611,28 @@ def test_run_logs_resolved_mojibake_settings(monkeypatch, tmp_path, caplog):
     assert "mojibake_sample_limit=3" in resolved_log
 
 
+def test_run_warns_on_console_when_mojibake_detection_is_on(monkeypatch, capsys, tmp_path):
+    obj = DbObject("SCOTT", "T1", "TABLE")
+    _stub_successful_run(monkeypatch, obj)
+    _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1"})
+
+    exit_code = _run(["--detect-mojibake", "--output-dir", str(tmp_path)])
+
+    assert exit_code == 0
+    assert "real column data" in capsys.readouterr().out
+
+
+def test_run_omits_mojibake_console_warning_when_detection_is_off(monkeypatch, capsys, tmp_path):
+    obj = DbObject("SCOTT", "T1", "TABLE")
+    _stub_successful_run(monkeypatch, obj)
+    _with_config(monkeypatch, {"owner": "SCOTT", "object": "T1"})
+
+    exit_code = _run(["--no-detect-mojibake", "--output-dir", str(tmp_path)])
+
+    assert exit_code == 0
+    assert "real column data" not in capsys.readouterr().out
+
+
 def test_detect_truncated_flag_defaults_to_none_and_supports_negation():
     assert _register().parse_args([]).detect_truncated is None
     assert _register().parse_args(["--detect-truncated"]).detect_truncated is True

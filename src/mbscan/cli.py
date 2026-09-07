@@ -167,6 +167,13 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
             "mbscan", "run",
             level=logging.DEBUG if debug_level == "dev" else logging.INFO,
         )
+        if resolved.scan.detect_mojibake:
+            print(
+                "Note: --detect-mojibake is enabled. Unlike every other check, the "
+                "generated report will contain real column data (not just character "
+                "counts) for any mojibake it finds -- handle the report like the "
+                "source data."
+            )
         logger.info(
             "Resolved settings: all_objects=%s requested_object_count=%s scope=%s row_limit=%s include_non_ascii=%s "
             "timeout_seconds=%s generate_fixes=%s fix_grouping=%s sample_row_limit=%s sample_char_limit=%s "
@@ -223,7 +230,10 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                 fix_paths: List[Path] = []
 
                 def _on_batch_start(selected, dependencies, charset, truncated_skip_reason):
-                    report_writer.start(selected, resolved.scan.scope, dependencies, truncated_skip_reason)
+                    report_writer.start(
+                        selected, resolved.scan.scope, dependencies, truncated_skip_reason,
+                        resolved.scan.detect_mojibake,
+                    )
 
                 def _on_object_scanned(obj_result):
                     report_writer.append_object(obj_result)

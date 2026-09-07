@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-from mbscan.files import TIMESTAMP_FORMAT, safe_filename_component
+from mbscan.files import TIMESTAMP_FORMAT, safe_filename_component, secure_chmod_file, secure_mkdir
 from mbscan.scan import ColumnScan, ScanBatchResult, ScanResult
 
 ScanOutput = Union[ScanResult, ScanBatchResult]
@@ -138,14 +138,37 @@ def _selected_objects(result: ScanOutput) -> Tuple:
     return result.selected
 
 
-def _header_lines(selected: Tuple, scope: str, dependencies, skip_reason: Optional[str]) -> List[str]:
+# Every other preview in this report shows character/count detail only. A
+# mojibake preview is the one exception -- it shows real column data (see
+# _render_mojibake_samples / MOJIBAKE_SAMPLE_VALUE_MAX_CHARS below). Anyone
+# opening the report file needs to see that before scrolling past the
+# header, not just in the README.
+MOJIBAKE_REPORT_WARNING = (
+    "WARNING: --detect-mojibake is enabled for this run. Unlike every other "
+    "check, mojibake previews below show real column data (truncated to "
+    "{0} characters), not just character counts. Handle this report like "
+    "the source data it was scanned from."
+).format(MOJIBAKE_SAMPLE_VALUE_MAX_CHARS)
+
+
+def _header_lines(
+    selected: Tuple,
+    scope: str,
+    dependencies,
+    skip_reason: Optional[str],
+    detect_mojibake: bool = False,
+) -> List[str]:
+    lines: List[str] = []
+    if detect_mojibake:
+        lines.append(MOJIBAKE_REPORT_WARNING)
+        lines.append("")
     if len(selected) == 1:
         selection_line = "selected: {0}.{1}".format(selected[0].owner, selected[0].name)
     else:
         selection_line = "selected objects: {0}".format(
             ", ".join("{0}.{1}".format(obj.owner, obj.name) for obj in selected)
         )
-    lines = [selection_line, "scope: {0}".format(scope)]
+    lines.extend([selection_line, "scope: {0}".format(scope)])
     if skip_reason:
         lines.append(skip_reason)
     for dep in dependencies:
@@ -167,7 +190,11 @@ def _object_lines(obj) -> List[str]:
 def render_report(result: ScanOutput) -> str:
     selected = _selected_objects(result)
     lines = _header_lines(
-        selected, result.settings.scope, result.dependencies, getattr(result, "truncated_skip_reason", None)
+        selected,
+        result.settings.scope,
+        result.dependencies,
+        getattr(result, "truncated_skip_reason", None),
+        result.settings.detect_mojibake,
     )
     for obj in result.objects:
         lines.extend(_object_lines(obj))
@@ -183,10 +210,18 @@ class IncrementalReportWriter:
     def __init__(self, path: Path):
         self.path = path
 
-    def start(self, selected: Tuple, scope: str, dependencies, skip_reason: Optional[str]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        header = _header_lines(selected, scope, dependencies, skip_reason)
+    def start(
+        self,
+        selected: Tuple,
+        scope: str,
+        dependencies,
+        skip_reason: Optional[str],
+        detect_mojibake: bool = False,
+    ) -> None:
+        secure_mkdir(self.path.parent)
+        header = _header_lines(selected, scope, dependencies, skip_reason, detect_mojibake)
         self.path.write_text("\n".join(header) + "\n", encoding="utf-8")
+        secure_chmod_file(self.path)
 
     def append_object(self, obj_result) -> None:
         with self.path.open("a", encoding="utf-8") as handle:
@@ -218,8 +253,9 @@ def write_report(
         name,
         timestamp or datetime.now(timezone.utc),
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(path.parent)
     path.write_text(render_report(result), encoding="utf-8")
+    secure_chmod_file(path)
     return path
 
 

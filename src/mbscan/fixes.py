@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from mbscan.files import TIMESTAMP_FORMAT, safe_filename_component
+from mbscan.files import TIMESTAMP_FORMAT, safe_filename_component, secure_chmod_file, secure_mkdir
 from mbscan.oracle.metadata import quote_identifier
 from mbscan.scan import (
     ColumnScan,
@@ -408,6 +408,7 @@ def write_fix_sql(
         obj_result.object.name,
         timestamp or datetime.now(timezone.utc),
     )
-    path.parent.mkdir(parents=True, exist_ok=True)
+    secure_mkdir(path.parent)
     path.write_text(sql, encoding="utf-8")
+    secure_chmod_file(path)
     return path
