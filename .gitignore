@@ -9,6 +9,9 @@ dist/
 .vscode/
 .idea/
 .claude/
+# personal dev docs -- gitignore-hygiene
+/docs/
+/AGENTS.md
 Thumbs.db
 desktop.ini
 
