@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from mbscan.files import LOG_DIR, secure_chmod_file, secure_mkdir
+from mbscan.files import LOG_DIR, open_private_text
 
 LOG_FILENAME_FORMAT = "mbscan-%Y-%m-%d.log"
 LOG_FORMAT = "%(asctime)s %(levelname)-5s [%(run_id)s] %(component)-24s %(message)s"
@@ -81,6 +81,16 @@ class _RunContextFilter(logging.Filter):
         return True
 
 
+class _PrivateFileHandler(logging.StreamHandler):
+    def close(self):
+        try:
+            if not self.stream.closed:
+                self.flush()
+                self.stream.close()
+        finally:
+            super().close()
+
+
 def configure_logging(
     owner: str,
     object_name: str,
@@ -108,16 +118,15 @@ def configure_logging(
         log_dir = LOG_DIR
 
     moment = timestamp or datetime.now(timezone.utc)
-    secure_mkdir(log_dir)
     path = log_dir / moment.strftime(LOG_FILENAME_FORMAT)
 
-    handler = logging.FileHandler(path, mode="a", encoding="utf-8")
-    secure_chmod_file(path)
+    handler = _PrivateFileHandler(open_private_text(path, append=True))
     formatter = _SafeLogFormatter(LOG_FORMAT)
     formatter.converter = time.gmtime
     handler.setFormatter(formatter)
     handler.addFilter(_RunContextFilter(uuid.uuid4().hex[:4]))
     logger.setLevel(level)
     logger.addHandler(handler)
+    logger.propagate = False
     logger.info("Run started")
     return path

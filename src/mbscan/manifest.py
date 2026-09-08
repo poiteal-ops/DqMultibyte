@@ -44,7 +44,7 @@ def _parse_columns(raw: Any, table: str) -> Tuple[str, ...]:
     seen: set[str] = set()
     for entry in raw:
         name = _require_non_empty_str(entry, "column name for table {0!r}".format(table))
-        key = name.upper()
+        key = name
         if key not in seen:
             seen.add(key)
             columns.append(name)

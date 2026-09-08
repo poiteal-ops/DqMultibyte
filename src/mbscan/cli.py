@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import logging
 import traceback
+from mbscan.repair_guards import repair_notice
 from pathlib import Path
 from typing import List, Optional
 
@@ -86,15 +87,16 @@ def _report_configuration_error(exc: Exception, debug_level: str, log_path: Opti
     text can embed config-file paths and setting values, and the console must
     never echo those back out. dev is an explicit opt-in for local
     troubleshooting: it prints the real message and traceback. The full
-    detail always goes to the log file either way (see logging_setup.py).
+    detail is logged only in dev mode.
     """
-    logger.error("Configuration error", exc_info=True)
     if debug_level == "dev":
+        logger.error("Configuration error", exc_info=True)
         print("Configuration error: {0}".format(exc))
         print(traceback.format_exc())
         if log_path is not None:
             print("Log: {0}".format(log_path))
     else:
+        logger.error("Configuration error")
         print("Configuration error: invalid or unavailable configuration.")
 
 
@@ -197,7 +199,7 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                     )
                     column_filter = {
                         (obj.owner, obj.name, obj.object_type): frozenset(
-                            name.upper() for name in table.columns
+                            table.columns
                         )
                         for table, obj in zip(manifest.tables, selected_objects)
                         if table.columns
@@ -243,16 +245,23 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
                             obj_result.object.owner, obj_result.object.name, col.name, col.status, col.reason,
                         )
                     if resolved.generate_fixes:
+                        if resolved.fix_grouping == "row":
+                            notice = repair_notice(obj_result)
+                            print(notice)
+                            logger.info(notice)
                         fix_path = write_fix_sql(obj_result, fixes_dir, fix_grouping=resolved.fix_grouping)
                         if fix_path is not None:
                             fix_paths.append(fix_path)
                             logger.info("Fix script written")
 
-                scan_objects(
-                    cursor, selected_objects, resolved.scan,
-                    progress=_progress, column_filter=column_filter,
-                    on_batch_start=_on_batch_start, on_object_scanned=_on_object_scanned,
-                )
+                try:
+                    scan_objects(
+                        cursor, selected_objects, resolved.scan,
+                        progress=_progress, column_filter=column_filter,
+                        on_batch_start=_on_batch_start, on_object_scanned=_on_object_scanned,
+                    )
+                finally:
+                    report_writer.close()
                 logger.info("Report written")
         print("Report written: {0}".format(path))
         for fix_path in fix_paths:
@@ -260,9 +269,8 @@ def run(args: argparse.Namespace, parser: argparse.ArgumentParser) -> int:
         print("Log written: {0}".format(log_path))
         run_complete()
         return 0
-    except (ConfigError, ValueError) as exc:
-        # prod: full traceback goes to the log file only -- the console message
-        # stays generic so it never echoes a raw config value back out.
+    except (ConfigError, ValueError, OSError) as exc:
+        # prod: logs and console both use a stable category, without raw values.
         # dev (config/config.toml debug_level = "dev"): the real message and
         # traceback print to the console too. See _report_configuration_error.
         _report_configuration_error(exc, debug_level, log_path)

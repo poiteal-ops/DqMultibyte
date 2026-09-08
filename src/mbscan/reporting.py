@@ -5,15 +5,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Tuple, Union
 
-from mbscan.files import TIMESTAMP_FORMAT, safe_filename_component, secure_chmod_file, secure_mkdir
+from mbscan.files import TIMESTAMP_FORMAT, safe_filename_component, artifact_suffix, open_private_text
 from mbscan.scan import ColumnScan, ScanBatchResult, ScanResult
+from mbscan.repair_guards import repair_notice
 
 ScanOutput = Union[ScanResult, ScanBatchResult]
 
 
 def build_report_path(output_dir: Path, owner: str, name: str, timestamp: datetime) -> Path:
-    return output_dir / "{0}_report_{1}_{2}.txt".format(
-        timestamp.strftime(TIMESTAMP_FORMAT), safe_filename_component(owner), safe_filename_component(name)
+    return output_dir / "{0}_report_{1}_{2}_{3}.txt".format(
+        timestamp.strftime(TIMESTAMP_FORMAT), safe_filename_component(owner), safe_filename_component(name), artifact_suffix(owner, name)
     )
 
 
@@ -183,6 +184,10 @@ def _object_lines(obj) -> List[str]:
     ]
     for note in getattr(obj, "notes", ()):
         lines.append("  note: {0}".format(note))
+    if getattr(obj, "repair_target", None) is not None or any(
+        note.startswith(("UNSUPPORTED_OBJECT", "MISSING_MARKER_ACCESS")) for note in getattr(obj, "notes", ())
+    ):
+        lines.append("  " + repair_notice(obj))
     lines.extend(_render_columns_table(obj.columns))
     return lines
 
@@ -209,6 +214,12 @@ class IncrementalReportWriter:
 
     def __init__(self, path: Path):
         self.path = path
+        self._handle = None
+
+    def close(self):
+        if self._handle is not None:
+            self._handle.close()
+            self._handle = None
 
     def start(
         self,
@@ -218,14 +229,18 @@ class IncrementalReportWriter:
         skip_reason: Optional[str],
         detect_mojibake: bool = False,
     ) -> None:
-        secure_mkdir(self.path.parent)
+        if self._handle is not None:
+            raise ValueError("Report already started")
         header = _header_lines(selected, scope, dependencies, skip_reason, detect_mojibake)
-        self.path.write_text("\n".join(header) + "\n", encoding="utf-8")
-        secure_chmod_file(self.path)
+        self._handle = open_private_text(self.path)
+        self._handle.write("\n".join(header) + "\n")
+        self._handle.flush()
 
     def append_object(self, obj_result) -> None:
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write("\n".join(_object_lines(obj_result)) + "\n")
+        if self._handle is None:
+            raise ValueError("Report is not open")
+        self._handle.write("\n".join(_object_lines(obj_result)) + "\n")
+        self._handle.flush()
 
 
 def _report_owner_and_name(selected: Tuple, batch_label: Optional[str]) -> Tuple[str, str]:
@@ -253,9 +268,8 @@ def write_report(
         name,
         timestamp or datetime.now(timezone.utc),
     )
-    secure_mkdir(path.parent)
-    path.write_text(render_report(result), encoding="utf-8")
-    secure_chmod_file(path)
+    with open_private_text(path) as handle:
+        handle.write(render_report(result))
     return path
 
 

@@ -1,7 +1,9 @@
 from types import SimpleNamespace
 
 import oracledb
+import pytest
 
+from mbscan.oracle.connection import ConfigError
 from mbscan.oracle.metadata import DbObject, quote_identifier
 from mbscan.scan import (
     MOJIBAKE_PREDICATE_TEMPLATE,
@@ -10,6 +12,7 @@ from mbscan.scan import (
     ScanSettings,
     TRUNCATION_CANDIDATE_PREDICATE_TEMPLATE,
     TruncatedRow,
+    _apply_column_allowlist,
     _extract_multibyte_chars,
     _parse_dump_decimal_bytes,
     _repair_mojibake_samples,
@@ -1052,6 +1055,52 @@ def test_scan_one_column_filter_restricts_scanned_columns_to_the_allowlist():
     )
 
     assert [col.name for col in result.columns] == ["NAME"]
+
+
+@pytest.mark.parametrize(
+    "requested, expected",
+    [
+        (frozenset({"Email"}), ["Email"]),
+        (frozenset({"EMAIL"}), ["EMAIL"]),
+        (frozenset({"Email", "EMAIL"}), ["Email", "EMAIL"]),
+    ],
+)
+def test_column_allowlist_prefers_each_exact_case_distinct_match(requested, expected):
+    notes = []
+
+    kept = _apply_column_allowlist(
+        [("Email", "VARCHAR2"), ("EMAIL", "VARCHAR2")],
+        requested,
+        DbObject("APP", "T1", "TABLE"),
+        notes,
+    )
+
+    assert [name for name, _ in kept] == expected
+    assert notes == []
+
+
+def test_column_allowlist_rejects_an_ambiguous_case_insensitive_match():
+    with pytest.raises(ConfigError, match="ambiguous"):
+        _apply_column_allowlist(
+            [("Email", "VARCHAR2"), ("EMAIL", "VARCHAR2")],
+            frozenset({"email"}),
+            DbObject("APP", "T1", "TABLE"),
+            [],
+        )
+
+
+def test_column_allowlist_keeps_a_unique_case_insensitive_match():
+    notes = []
+
+    kept = _apply_column_allowlist(
+        [("Email", "VARCHAR2")],
+        frozenset({"email"}),
+        DbObject("APP", "T1", "TABLE"),
+        notes,
+    )
+
+    assert kept == [("Email", "VARCHAR2")]
+    assert notes == []
 
 
 def test_scan_one_column_filter_notes_an_unknown_column_and_scans_the_rest():
