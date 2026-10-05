@@ -2,6 +2,27 @@
 # use as defaults. Every key here can also be passed as a CLI flag; a CLI
 # flag only overrides its matching key if you actually pass it.
 
+# --- Specialised checks: choose AT MOST ONE ------------------------------
+# detect_truncated and detect_mojibake are mutually exclusive. Enabling both
+# (in the file, or one here and the other via a CLI flag) is rejected with an
+# error -- nothing is scanned. Leave both false for the default multibyte scan.
+
+# Detect rows whose stored bytes hold an incomplete multibyte character
+# (SAS-DI "character cut in half"; Oracle raises ORA-29275 reading them).
+# This is the tool's primary purpose, so when true it is the ONLY check that
+# runs -- multibyte counts, mojibake, and non-ASCII are all skipped. Cannot be
+# combined with detect_mojibake.
+# Reads the raw bytes via UTL_RAW.CAST_TO_RAW (values over 2000 bytes are
+# reconstructed with DUMP); VARCHAR2/CHAR only; needs a UTF-8 database
+# character set (AL32UTF8 or UTF8) or it self-skips.
+detect_truncated = false
+
+# Detect mojibake (SAS-DI UTF-8 read as Windows-1252) and show a repaired
+# preview per sample. Cannot be combined with detect_truncated. NOTE: unlike
+# every other check, the report then contains real column data.
+detect_mojibake = false
+mojibake_sample_limit = 10
+
 owner = "SCOTT"
 # object = "CUSTOMER_ADDRESSES"
 # object = "EMPLOYEES,DEPARTMENTS"
@@ -27,20 +48,8 @@ fix_grouping = "row"
 sample_row_limit = 200
 sample_char_limit = 20
 
-detect_mojibake = false
-mojibake_sample_limit = 10
-
 # "prod" (default) keeps console/log error output generic and code-only --
 # never a raw config value, Oracle message, or traceback. "dev" is an
 # explicit opt-in for local troubleshooting: it prints the real error
 # message and traceback to the console and raises the log level to DEBUG.
 # debug_level = "dev"
-
-# Detect rows whose stored bytes hold an incomplete multibyte character
-# (SAS-DI "character cut in half"; Oracle raises ORA-29275 reading them).
-# This is the tool's primary purpose, so when true it is the ONLY check that
-# runs -- multibyte counts, mojibake, and non-ASCII are all skipped.
-# Reads the raw bytes via UTL_RAW.CAST_TO_RAW (values over 2000 bytes are
-# reconstructed with DUMP); VARCHAR2/CHAR only; needs a UTF-8 database
-# character set (AL32UTF8 or UTF8) or it self-skips.
-detect_truncated = false

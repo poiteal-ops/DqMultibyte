@@ -122,6 +122,12 @@ def resolve_settings(config: Dict[str, Any], args: Any) -> ResolvedSettings:
         else config.get("detect_truncated", False)
     )
     detect_truncated = _validate_bool(detect_truncated, "detect_truncated")
+    if detect_truncated and detect_mojibake:
+        raise ConfigError(
+            "detect_truncated and detect_mojibake are mutually exclusive: "
+            "enable only one per run (e.g. pass --no-detect-mojibake or "
+            "--no-detect-truncated to override the config file)"
+        )
     output_dir = Path(args.output_dir) if args.output_dir is not None else Path(config.get("output_dir", REPORTS_DIR))
     fixes_dir_value = args.fixes_dir if args.fixes_dir is not None else config.get("fixes_dir")
     fixes_dir = Path(fixes_dir_value) if fixes_dir_value is not None else None

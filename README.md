@@ -45,6 +45,9 @@ it.
 
 | Key | Meaning | Default if unset |
 |---|---|---|
+| `detect_truncated` | Detect rows whose stored bytes hold an **incomplete** multibyte character -- the SAS DI "character cut in half" corruption Oracle reports as `ORA-29275: partial multibyte character`. This is the tool's primary purpose, so **when true it is the only check that runs** (multibyte counts, mojibake, and non-ASCII are skipped). `VARCHAR2`/`CHAR` only; self-skips unless the database character set is `AL32UTF8` or `UTF8`  **Mutually exclusive with `detect_mojibake`** -- enabling both is rejected with an error. | `false` |
+| `detect_mojibake` | Also scan for mojibake (SAS DI-style UTF-8-misread-as-Windows-1252 corruption) and report a repaired preview alongside each garbled sample. **Unlike every other check, this writes real column data into the report** -- see "Note on report contents" below  **Mutually exclusive with `detect_truncated`** -- enabling both is rejected with an error. | `false` |
+| `mojibake_sample_limit` | Max flagged rows fetched per column to search for mojibake values | `10` |
 | `owner` | Oracle schema to scan | none -- must be supplied here, on the CLI, or interactively |
 | `object` | One or more comma-separated table/view/materialized view names | none -- same as above |
 | `all_objects` | Scan every visible table, view, and materialized view; overrides `object` when true | `false` |
@@ -58,9 +61,6 @@ it.
 | `fix_grouping` | `"row"`: guarded, consolidated updates requiring unchanged original-byte evidence after a row lock. Unsupported or unverifiable rows receive no executable repair. `"column"`: legacy predicate updates at execution time, without scan-time stale-data protection; can touch rows outside a bounded scan | `"row"` |
 | `sample_row_limit` | Max flagged rows fetched per column to search for multibyte characters | `200` |
 | `sample_char_limit` | Max distinct multibyte characters shown per column | `20` |
-| `detect_mojibake` | Also scan for mojibake (SAS DI-style UTF-8-misread-as-Windows-1252 corruption) and report a repaired preview alongside each garbled sample. **Unlike every other check, this writes real column data into the report** -- see "Note on report contents" below | `false` |
-| `mojibake_sample_limit` | Max flagged rows fetched per column to search for mojibake values | `10` |
-| `detect_truncated` | Detect rows whose stored bytes hold an **incomplete** multibyte character -- the SAS DI "character cut in half" corruption Oracle reports as `ORA-29275: partial multibyte character`. This is the tool's primary purpose, so **when true it is the only check that runs** (multibyte counts, mojibake, and non-ASCII are skipped). `VARCHAR2`/`CHAR` only; self-skips unless the database character set is `AL32UTF8` or `UTF8` | `false` |
 | `json_entry` | Read the exact table+column targets from a JSON manifest instead of `owner`/`object`/`all_objects`. Mutually exclusive with all three and with `--interactive` | `false` |
 | `json_entry_file` | Path to that manifest | `config/scan_targets.json` |
 | `debug_level` | `"prod"` or `"dev"`. `"dev"` raises the log level to `DEBUG` and lets real error text (Oracle messages, config values, tracebacks) reach the console and log -- local troubleshooting only, see [Logging](#logging). Config-file only, no CLI flag | `"prod"` |
@@ -68,6 +68,16 @@ it.
 Object names are matched case-insensitively against Oracle's dictionary
 (exact case wins if there's a tie); comma-separated lists are trimmed and
 de-duplicated.
+
+### Choosing a check: `detect_truncated` OR `detect_mojibake`
+
+These two are **mutually exclusive**. Setting both to `true` -- in
+`config/config.toml`, on the command line, or one in each -- stops the run
+with a `ConfigError` before anything is scanned; it never silently runs one
+and ignores the other. (A CLI flag overrides only its own key, so with
+`detect_truncated = true` in the file, `--detect-mojibake` alone is rejected:
+pass `--no-detect-truncated` as well.) With neither enabled you get the
+default multibyte scan.
 
 ### Partial / truncated multibyte characters (`detect_truncated`)
 
@@ -174,6 +184,7 @@ mbscan --fix-grouping column
 # Widen how many rows/characters are sampled for the multibyte character detail
 mbscan --sample-row-limit 1000 --sample-char-limit 50
 
+# (detect-mojibake and detect-truncated cannot be used in the same run)
 # Also scan for mojibake (SAS DI-style UTF-8-misread-as-Windows-1252
 # corruption) and widen how many mojibake rows are sampled per column
 mbscan --detect-mojibake --mojibake-sample-limit 25
