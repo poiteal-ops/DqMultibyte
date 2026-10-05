@@ -6,6 +6,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-05
+
 ### Added
 
 - Row-grouped repair scripts now carry scan-time row evidence and revalidate
@@ -25,8 +27,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   scanning more than one object, so it's visible which table is currently
   running instead of only a generic progress count.
 
+### Changed
+
+- `detect_truncated` and `detect_mojibake` are now mutually exclusive: enabling
+  both -- in `config/config.toml`, on the command line, or one in each (a CLI
+  flag overrides only its own key) -- is rejected with a `ConfigError` before
+  anything is scanned, instead of silently ignoring `detect_mojibake`.
+  **Behaviour change** for configs that set both; pass `--no-detect-truncated`
+  or `--no-detect-mojibake` to resolve it. Documented in the README, the example
+  config and `AGENTS.md`.
+- `config/config.example.toml` and the README option table now list
+  `detect_truncated`, then `detect_mojibake`, first.
+
 ### Fixed
 
+- Mojibake detection missed two kinds of SAS-DI-style corruption, so those rows
+  were neither counted nor given an exact repair:
+  - values containing the cp1252 "undefined" bytes 0x81/0x8D/0x8F/0x90/0x9D
+    passed through as C1 characters (garbled `Á`, `Í`, `Ý`, `Ł`, `”`);
+  - 4-byte UTF-8 sequences (emoji and other supplementary characters, e.g.
+    `ðŸ˜€`), via a new F0-F4 branch in `MOJIBAKE_PREDICATE_TEMPLATE`.
+  The cp1252 round-trip guard and repair expression are unchanged. Verified
+  against Oracle 23c AL32UTF8 with synthetic values (garbled values flagged,
+  genuine text and mojibake-plus-CJK values still not). The `DQ_TEST` tables
+  contain none of these patterns, so a scan there gives identical counts
+  before and after. Still not detected: values over 2000 characters and
+  mojibake mixed with non-cp1252 characters (both fall to the lossy `CONVERT`
+  bucket), and corruption whose undefined bytes were dropped or replaced by
+  the source system.
 - Production-mode startup and scan failures no longer expose exception details
   or tracebacks through the console or logger propagation.
 - Boolean configuration values must now be real TOML booleans; quoted strings

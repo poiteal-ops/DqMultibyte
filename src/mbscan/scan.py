@@ -30,6 +30,13 @@ _MOJIBAKE_CONTINUATION_SPECIAL_CODEPOINTS = (
     338, 339, 352, 353, 376, 381, 382, 402, 710, 732, 8211, 8212, 8216, 8217,
     8218, 8220, 8221, 8222, 8224, 8225, 8226, 8230, 8240, 8249, 8250, 8364, 8482,
 )
+# cp1252 leaves bytes 0x81, 0x8D, 0x8F, 0x90 and 0x9D undefined. A source that
+# passes them through as the same-numbered C1 control characters (U+0081 ...)
+# still produces repairable mojibake -- e.g. A-acute is C3 81, so it reads as
+# U+00C3 U+0081 -- so they are valid continuation characters too. Verified
+# live against Oracle 23c AL32UTF8: the round-trip guard and the repair
+# expression both handle them; only this detection class used to miss them.
+_MOJIBAKE_CONTINUATION_UNDEFINED_CP1252 = (0x81, 0x8D, 0x8F, 0x90, 0x9D)
 
 
 def _unistr_class(codepoints):
@@ -44,10 +51,14 @@ def _unistr_class(codepoints):
 
 
 _MOJIBAKE_CONTINUATION_CLASS_SQL = _unistr_class(
-    list(range(0xA0, 0xC0)) + list(_MOJIBAKE_CONTINUATION_SPECIAL_CODEPOINTS)
+    list(range(0xA0, 0xC0))
+    + list(_MOJIBAKE_CONTINUATION_UNDEFINED_CP1252)
+    + list(_MOJIBAKE_CONTINUATION_SPECIAL_CODEPOINTS)
 )
 _MOJIBAKE_LEAD2_CLASS_SQL = _unistr_class(list(range(0xC2, 0xE0)))
 _MOJIBAKE_LEAD3_CLASS_SQL = _unistr_class(list(range(0xE0, 0xF0)))
+# 4-byte UTF-8 sequences (emoji, other supplementary-plane characters).
+_MOJIBAKE_LEAD4_CLASS_SQL = _unistr_class(list(range(0xF0, 0xF5)))
 
 # Windows-1252 round-trip guard. UTL_I18N.STRING_TO_RAW(col, 'WE8MSWIN1252')
 # -- the first half of the repair expression -- silently substitutes byte 0xBF
@@ -79,7 +90,9 @@ MOJIBAKE_PREDICATE_TEMPLATE = (
     "((REGEXP_LIKE({0}, '[' || " + _MOJIBAKE_LEAD2_CLASS_SQL + " || '][' || "
     + _MOJIBAKE_CONTINUATION_CLASS_SQL + " || ']')"
     " OR REGEXP_LIKE({0}, '[' || " + _MOJIBAKE_LEAD3_CLASS_SQL + " || '][' || "
-    + _MOJIBAKE_CONTINUATION_CLASS_SQL + " || ']{{2}}'))"
+    + _MOJIBAKE_CONTINUATION_CLASS_SQL + " || ']{{2}}')"
+    " OR REGEXP_LIKE({0}, '[' || " + _MOJIBAKE_LEAD4_CLASS_SQL + " || '][' || "
+    + _MOJIBAKE_CONTINUATION_CLASS_SQL + " || ']{{3}}'))"
     " AND " + _MOJIBAKE_CP1252_ROUNDTRIP_GUARD + ")"
 )
 

@@ -394,3 +394,23 @@ def test_resolve_settings_capture_mojibake_rowids_derivation(
     )
 
     assert resolved.scan.capture_mojibake_rowids is expected
+
+
+def test_resolve_settings_rejects_detect_truncated_and_detect_mojibake_together():
+    with pytest.raises(ConfigError, match="mutually exclusive"):
+        settings.resolve_settings(
+            {"detect_truncated": True, "detect_mojibake": True}, _args()
+        )
+
+
+def test_resolve_settings_rejects_cli_flag_that_combines_with_config_check():
+    with pytest.raises(ConfigError, match="mutually exclusive"):
+        settings.resolve_settings({"detect_truncated": True}, _args(detect_mojibake=True))
+
+
+def test_resolve_settings_allows_cli_to_switch_off_the_other_check():
+    resolved = settings.resolve_settings(
+        {"detect_truncated": True}, _args(detect_mojibake=True, detect_truncated=False)
+    )
+
+    assert resolved.scan.detect_mojibake and not resolved.scan.detect_truncated

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mbscan"
-version = "0.1.0"
+version = "0.2.0"
 description = "Scan Oracle tables/views/materialized views for multibyte and mojibake character corruption, and generate a reviewable (never auto-run) fix script."
 readme = "README.md"
 requires-python = ">=3.11"

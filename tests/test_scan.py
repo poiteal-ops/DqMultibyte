@@ -394,7 +394,7 @@ def test_mojibake_predicate_template_format_succeeds_with_literal_quantifier():
     constant's own .format() call in _scan_one as a literal {2}, not the
     {{2}} escape it's written with in source.
 
-    The template now references {0} five times (two REGEXP_LIKE branches plus
+    The template now references {0} six times (three REGEXP_LIKE branches plus
     three in the cp1252 round-trip guard: its LENGTH gate and two in the
     equality); repeated positional references are legal in str.format(), but a
     single .format(quoted) call must still substitute every one of them without
@@ -406,16 +406,16 @@ def test_mojibake_predicate_template_format_succeeds_with_literal_quantifier():
     assert "{2}" in predicate
     assert "{{2}}" not in predicate
     assert "{0}" not in predicate
-    assert MOJIBAKE_PREDICATE_TEMPLATE.count("{0}") == 5
-    assert predicate.count(quoted) == 5
+    assert MOJIBAKE_PREDICATE_TEMPLATE.count("{0}") == 6
+    assert predicate.count(quoted) == 6
 
 
-def test_mojibake_predicate_template_ands_a_cp1252_roundtrip_guard_onto_both_branches():
+def test_mojibake_predicate_template_ands_a_cp1252_roundtrip_guard_onto_all_branches():
     """Finding 2 (Critical): UTL_I18N.STRING_TO_RAW(col, 'WE8MSWIN1252')
     substitutes byte 0xBF for characters outside cp1252, so a value holding
     genuine mojibake next to a correctly-stored non-cp1252 character would
     "repair" into invalid UTF-8. The guard must be ANDed once onto the whole
-    (branch1 OR branch2) group -- not per-branch -- so detection, counts,
+    (branch1 OR branch2 OR branch3) group -- not per-branch -- so detection, counts,
     ROWIDs and both fix modes inherit one consistent exclusion."""
     quoted = quote_identifier("X")
 
@@ -432,7 +432,7 @@ def test_mojibake_predicate_template_ands_a_cp1252_roundtrip_guard_onto_both_bra
     assert predicate.startswith("((REGEXP_LIKE(")
     or_group, _, tail = predicate.partition(" AND " + guard)
     assert tail == ")"
-    assert or_group.count(" OR REGEXP_LIKE(") == 1
+    assert or_group.count(" OR REGEXP_LIKE(") == 2
     assert or_group.endswith("))")
 
 
@@ -1198,3 +1198,33 @@ def test_scan_one_default_detect_mojibake_false_preserves_prior_behavior():
     assert col.mojibake_samples == ()
     assert col.mojibake_samples_truncated is False
     assert col.mojibake_samples_skipped == 0
+
+
+def _unistr_codepoints(class_sql):
+    """Codepoints inside a UNISTR class literal."""
+    import re
+    return {int(h, 16) for h in re.findall(r"\\([0-9A-F]{4})", class_sql)}
+
+
+def test_mojibake_continuation_class_covers_the_undefined_cp1252_bytes():
+    """cp1252 leaves 0x81/0x8D/0x8F/0x90/0x9D undefined; a source that passes
+    them through as the same-numbered C1 characters garbles Á, Í, Ý, Ł and the
+    right double quote. Verified live against Oracle 23c AL32UTF8: the round-trip
+    guard and repair already handle these, only the detection class missed them."""
+    from mbscan.scan import _MOJIBAKE_CONTINUATION_CLASS_SQL
+
+    codepoints = _unistr_codepoints(_MOJIBAKE_CONTINUATION_CLASS_SQL)
+
+    assert {0x81, 0x8D, 0x8F, 0x90, 0x9D} <= codepoints
+
+
+def test_mojibake_predicate_has_a_four_byte_branch_for_supplementary_characters():
+    """Emoji and other supplementary characters are 4 UTF-8 bytes (F0-F4 lead
+    + 3 continuation), which neither the 2-byte nor the 3-byte branch matches."""
+    from mbscan.scan import _MOJIBAKE_LEAD4_CLASS_SQL
+
+    predicate = MOJIBAKE_PREDICATE_TEMPLATE.format(quote_identifier("X"))
+
+    assert _unistr_codepoints(_MOJIBAKE_LEAD4_CLASS_SQL) == set(range(0xF0, 0xF5))
+    assert _MOJIBAKE_LEAD4_CLASS_SQL in predicate
+    assert "']{3}'" in predicate
